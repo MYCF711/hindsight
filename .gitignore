@@ -67,6 +67,7 @@ hindsight-cli/target
 hindsight-clients/rust/target
 .claude/*
 !.claude/skills/
+!.claude/rules/
 whats-next.md
 TASK.md
 # Parked / draft integrations that aren't ready to ship

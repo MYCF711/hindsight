@@ -264,7 +264,7 @@ ignore = [
 [tool.ruff.lint.isort]
 known-third-party = ["alembic"]
 
-# Production HTTP is aiohttp, async only (see .claude/skills/code-review/SKILL.md).
+# Production HTTP is aiohttp, async only (see .claude/rules/python.md).
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "httpx".msg = "Use aiohttp (async) via hindsight_api.engine.aiohttp_session. httpx is allowed only to configure or classify a third-party SDK built on it, with a `# noqa: TID251` saying so."
 "requests".msg = "Sync HTTP is forbidden in production code; use aiohttp via hindsight_api.engine.aiohttp_session."

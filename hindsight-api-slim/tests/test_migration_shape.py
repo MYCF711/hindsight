@@ -34,7 +34,7 @@ def test_migration_uses_dialect_dispatcher(path: Path) -> None:
     )
     assert imports_dispatcher, (
         f"{path.name}: missing 'from hindsight_api.alembic._dialect import run_for_dialect'. "
-        "All migrations must dispatch through run_for_dialect — see CLAUDE.md."
+        "All migrations must dispatch through run_for_dialect. See .claude/rules/migrations.md."
     )
 
     top_level_fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}

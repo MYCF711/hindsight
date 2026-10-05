@@ -163,7 +163,7 @@ class TestDeltaEditorialFusion:
             # words. A keyword list cannot tell the two apart: this asserted
             # `"keyword" in fused`, and CI went red on a refresh that had faithfully kept
             # every SEO rule but wrote them as "search terms" and "search intent" (the
-            # guidance was there; only the token was missing). Per CLAUDE.md, judge the
+            # guidance was there; only the token was missing). Per .claude/rules/llm-judge-tests.md, judge the
             # non-deterministic half and keep direct asserts for the structural one.
             await assert_meets_criteria(
                 response=fused,

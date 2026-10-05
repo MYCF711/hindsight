@@ -15,7 +15,7 @@ Real-LLM test, because the thing under test is what the model does with the
 prompt and the schema. MockLLM echoes its input, so it cannot exercise the
 pressure that produces the fabrication, and the fields' nullability alone is a
 structural fact covered by `test_fact_extraction_nullable_dimensions.py`. That
-split is the one CLAUDE.md asks for: mechanics in a fast unit test,
+split is the one .claude/rules/llm-judge-tests.md asks for: mechanics in a fast unit test,
 model-following behaviour judged here.
 
 Note what this can and cannot show. It passes when the model is faithful; it is

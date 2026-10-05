@@ -1,7 +1,6 @@
 ---
 name: hs-release
 description: Cut a core Hindsight release (vX.Y.Z) and open the changelog + blog PR. Use when asked to cut/start a release, bump the version, or publish a new Hindsight version.
-user_invocable: true
 ---
 
 # Hindsight Release

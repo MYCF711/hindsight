@@ -87,7 +87,7 @@ class TestPoolWiring:
 _API_ROOT = Path(__file__).resolve().parents[1] / "hindsight_api"
 
 # migrations.py holds a grandfathered advisory lock (tracked for removal, see
-# CLAUDE.md); it runs on its own connection, not a pooled one.
+# .claude/rules/python.md); it runs on its own connection, not a pooled one.
 _ADVISORY_LOCK_ALLOWED = {_API_ROOT / "migrations.py"}
 
 # The pool's own session GUCs (this is the state the reset used to wipe and the

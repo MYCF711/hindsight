@@ -5,7 +5,7 @@ is the part that is not: whether the model reads the picture, and whether it
 reads it *in the context of the prose around it* rather than as a standalone
 image. MockLLM cannot simulate that, and exact string matching on extracted
 facts flakes across providers and runs — so this uses a real LLM plus the judge,
-per the testing convention in CLAUDE.md.
+per the testing convention in .claude/rules/llm-judge-tests.md.
 
 The images are drawn here rather than committed as fixtures: a generated UI mock
 says exactly what it is meant to say, and the test stays readable next to what it

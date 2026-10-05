@@ -1,7 +1,6 @@
 ---
 name: ship-it
-description: Take a PR from review to merged — run the repo's code-review skill on it in a loop (review, fix, re-review) until nothing is left to fix, applying ALL fixes on the PR branch, wait for CI green, then squash-merge. Use when asked to "ship it", "ship PR #N", or "review, fix and merge" a PR.
-user_invocable: true
+description: Take a PR from review to merged. Run the repo's code-review skill on it in a loop (review, fix, re-review) until nothing is left to fix, apply every fix on the PR branch, wait for CI green, then squash-merge. Use when asked to "ship it", "ship PR #N", or "review, fix and merge" a PR.
 ---
 
 # Ship It
@@ -67,7 +66,7 @@ Read and follow the repo's code-review skill at its absolute path,
 
 Classify each against step 0. Any blocker → stop and ask.
 
-## 4. Apply ALL fixes
+## 4. Apply every fix
 
 - Fix every finding, not just the must-fixes. Stay in the PR's scope — don't refactor neighbouring code the review didn't flag.
 - Run `./scripts/hooks/lint.sh` and the tests covering the touched code (see CLAUDE.md for commands).

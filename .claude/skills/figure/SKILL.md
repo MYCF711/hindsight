@@ -1,7 +1,6 @@
 ---
 name: figure
 description: Draw an animated figure (boxes, arrows, moving data) as one self-contained SVG for a GitHub README, PR, issue or blog post. Use when a change or an explanation needs a diagram — how a request flows, what a background job does, what a feature changed — or when the user asks for a diagram, figure, animation or "show it visually". The docs site uses the interactive React figures instead.
-user_invocable: true
 ---
 
 # Figure
