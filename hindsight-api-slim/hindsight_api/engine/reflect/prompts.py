@@ -447,11 +447,11 @@ def build_system_prompt_for_tools(
             parts.extend(
                 [
                     "## RESEARCH DEPTH: SHALLOW (Quick Response)",
-                    "- Prioritize speed over completeness",
-                    "- If mental models or observations provide a reasonable answer, stop there",
-                    "- Only dig deeper if the initial results are clearly insufficient",
-                    "- Prefer a quick overview rather than exhaustive details",
-                    "- Answer promptly with available information",
+                    "- Keep the ANSWER short: a quick overview, not exhaustive detail. Depth is what you cut, not coverage",
+                    "- Spend few searches, but make them count: vary the query instead of repeating one that already ran",
+                    "- A mental model or observation that ANSWERS the question is enough to stop; one that is merely on the same topic is not",
+                    "- If what you found does not cover the question, go on to the next level rather than answering from it",
+                    "- MANDATORY: never report that the bank holds nothing (no decision, record, or history) about something until recall() has been called with the question's key terms (an issue key, name, or identifier) verbatim",
                     "",
                 ]
             )
@@ -462,6 +462,8 @@ def build_system_prompt_for_tools(
                     "- Balance thoroughness with efficiency",
                     "- Check multiple sources when the question warrants it",
                     "- Verify stale data if it's central to the answer",
+                    "- A result that is merely on the same topic does not answer the question: when it does not cover it, go on to the next level",
+                    "- MANDATORY: never report that the bank holds nothing (no decision, record, or history) about something until recall() has been called with the question's key terms (an issue key, name, or identifier) verbatim",
                     "- Don't over-explore, but ensure reasonable coverage",
                     "",
                 ]
