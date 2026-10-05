@@ -182,11 +182,16 @@ _DONE_ANSWER_DEFAULT_LANGUAGE = (
     "language directive in the system prompt specifies a different language, follow that directive instead."
 )
 
+_DONE_SUFFICIENCY_GATE = " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only shares the question's topic is not an answer, so search the next level (search_observations, then recall) instead of answering around it. Never call done to report that nothing is known unless recall has already run on the question's key terms."
+
 TOOL_DONE_ANSWER = {
     "type": "function",
     "function": {
         "name": "done",
-        "description": "Signal completion with your final answer. Use this when you have gathered enough information to answer the question.",
+        "description": (
+            "Signal completion with your final answer. Use this when you have gathered enough information "
+            "to answer the question." + _DONE_SUFFICIENCY_GATE
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -284,7 +289,7 @@ def _done_tool_for_document(base: dict) -> dict:
     params["required"] = ["document"] + [name for name in params.get("required", []) if name != "answer"]
     tool["function"]["description"] = (
         "Signal completion with your final answer, as a structured document. Use this when you have "
-        "gathered enough information to answer the question."
+        "gathered enough information to answer the question." + _DONE_SUFFICIENCY_GATE
     )
     return tool
 
