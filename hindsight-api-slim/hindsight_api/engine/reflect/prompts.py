@@ -375,7 +375,9 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no observations exist, they're stale, or you need specific details",
-                "- MANDATORY: If search_observations returns 0 results or count=0, you MUST call recall() before giving up",
+                "- MANDATORY: If search_observations returns 0 results or count=0, OR returns observations that do "
+                "not STATE the answer, you MUST call recall() before giving up. Never report that the bank holds "
+                "nothing about something until recall() has run with the question's key terms verbatim",
                 "- This is the source of truth that observations are built from",
                 "",
                 "**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).",
@@ -522,7 +524,8 @@ def build_system_prompt_for_tools(
             "If the levels above are stale, do not state the answer, OR you need specific details, "
             "use recall() for raw facts. Reporting that nothing is known requires recall() first"
             if has_mental_models
-            else "If search_observations returns 0 results OR observations are stale, you MUST call recall() for raw facts"
+            else "If search_observations returns 0 results, is stale, OR does not state the answer, you MUST call "
+            "recall() for raw facts"
         )
     elif has_mental_models:
         steps.append(

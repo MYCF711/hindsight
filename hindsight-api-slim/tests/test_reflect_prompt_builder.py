@@ -200,7 +200,7 @@ You have access to TWO levels of knowledge. Use them in this order:
 ### 2. RAW FACTS (recall) - Ground Truth
 - Individual memories (world facts and experiences)
 - Use when: no observations exist, they're stale, or you need specific details
-- MANDATORY: If search_observations returns 0 results or count=0, you MUST call recall() before giving up
+- MANDATORY: If search_observations returns 0 results or count=0, OR returns observations that do not STATE the answer, you MUST call recall() before giving up. Never report that the bank holds nothing about something until recall() has run with the question's key terms verbatim
 - This is the source of truth that observations are built from
 
 **Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).
@@ -245,7 +245,7 @@ _WORKFLOW_MM_ONLY = """\
 _WORKFLOW_OBS_ONLY = """\
 ## Workflow
 1. First, try search_observations() - check for consolidated knowledge
-2. If search_observations returns 0 results OR observations are stale, you MUST call recall() for raw facts
+2. If search_observations returns 0 results, is stale, OR does not state the answer, you MUST call recall() for raw facts
 3. Use expand() if you need more context on specific memories
 4. When ready, call done() with your answer and supporting IDs\
 """
