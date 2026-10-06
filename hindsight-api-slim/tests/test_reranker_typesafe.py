@@ -17,6 +17,7 @@ from hindsight_api.engine.cross_encoder import (
     _OPTION_KEY_OVERHEAD,
     TypeSafeCrossEncoder,
     create_cross_encoder_from_env,
+    rerank_instructions,
 )
 from hindsight_api.engine.token_encoding import count_tokens
 
@@ -169,6 +170,42 @@ class TestRanking:
         encoder, session = _encoder({})
         assert await encoder._predict([]) == []
         assert session.posted == []
+
+
+class TestRankingRules:
+    @pytest.mark.asyncio
+    async def test_the_banks_rules_join_the_rank_question(self):
+        encoder, session = _encoder({"c0": 0.6, "c1": 0.4})
+        token = rerank_instructions.set("- prefer what the user said")
+        try:
+            await encoder._predict([("who paid?", "a"), ("who paid?", "b")])
+        finally:
+            rerank_instructions.reset(token)
+
+        instructions = session.rank_requests[0]["questions"]["rank"]["instructions"]
+        assert "who paid?" in instructions
+        assert "- prefer what the user said" in instructions
+
+    @pytest.mark.asyncio
+    async def test_no_rules_leaves_the_plain_question(self):
+        encoder, session = _encoder({"c0": 0.6, "c1": 0.4})
+        await encoder._predict([("who paid?", "a"), ("who paid?", "b")])
+
+        assert session.rank_requests[0]["questions"]["rank"]["instructions"] == (
+            "Which candidate answers the question: who paid?"
+        )
+
+    @pytest.mark.asyncio
+    async def test_oversized_rules_are_capped(self):
+        encoder, session = _encoder({"c0": 0.6, "c1": 0.4})
+        token = rerank_instructions.set("prefer newer facts. " * 5000)
+        try:
+            await encoder._predict([("q", "a"), ("q", "b")])
+        finally:
+            rerank_instructions.reset(token)
+
+        instructions = session.rank_requests[0]["questions"]["rank"]["instructions"]
+        assert count_tokens(instructions) < 2_100
 
 
 class TestChunking:
