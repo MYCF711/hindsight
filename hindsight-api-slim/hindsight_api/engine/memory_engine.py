@@ -9830,10 +9830,12 @@ class MemoryEngine(MemoryEngineInterface):
                     # lets it place relative times ("last month") the way the temporal boost did.
                     rules = reranker_instructions or get_config().reranker_instructions
                     today = _recall_scoring_now(question_date).date().isoformat()
+                    # Date first: the reranker caps how much of this it will carry, and a
+                    # verbose bank rulebook must not be what pushes the date out.
                     reranked = await reranker_instance.rerank(
                         query,
                         merged_candidates,
-                        instructions=f"{rules}\n- Today's date is {today}.",
+                        instructions=f"- Today's date is {today}.\n{rules}",
                     )
                     scored_results = reranked.results
                     # Copied off the call that produced these scores. Do not read
