@@ -586,6 +586,32 @@ class TestConflictResolution:
         encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
         assert encoder._duplicates([self.STALE, self.STALE + ", as agreed"], [0, 1]) == {1}
 
+    @pytest.mark.asyncio
+    async def test_a_confident_verdict_reaches_every_stale_restatement(self):
+        """The same stale value restated many times spreads across several clusters, and the
+        hedged ones are skipped. Dropping only the question's own members leaves the majority
+        stale, which is what a generator answers from."""
+        stale = [f"{self.STALE} (restated {n})" for n in range(5)]
+        docs = [self.CURRENT, *stale]
+        encoder, _ = self._encoder(choice="c0", confidence=0.95)
+        order = list(range(len(docs)))
+        superseded = await encoder._superseded(self.QUERY, docs, order)
+        assert 0 not in superseded, "the winner must survive"
+        assert len(superseded) == len(stale), "every candidate disagreeing with the winner goes"
+
+    def test_a_crowded_conflict_is_narrowed_not_skipped(self):
+        """A stale value restated many times against one correction is the case that matters.
+        Discarding the cluster for being large leaves the majority standing, and a generator
+        reading ten stale restatements and one correction answers with the stale one."""
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
+        stale = [f"{self.STALE} in phase {n}" for n in range(encoder.CONFLICT_MAX_CLUSTER + 5)]
+        docs = [self.CURRENT, *stale]
+        order = list(range(len(docs)))
+        clusters = encoder._conflict_clusters(self.QUERY, docs, order)
+        assert clusters, "a crowded conflict must still be resolved"
+        assert all(len(cluster) <= encoder.CONFLICT_MAX_CLUSTER for cluster in clusters)
+        assert any(0 in cluster for cluster in clusters), "the correction has to be in the question"
+
     def test_a_cluster_is_the_anchor_and_its_direct_peers_only(self):
         """Grouping transitively collapsed a whole pool into one component; anchoring on
         each top-ranked candidate is what stops the chaining."""

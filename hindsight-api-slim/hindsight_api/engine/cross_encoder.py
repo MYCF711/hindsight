@@ -1231,8 +1231,12 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     # the trigger fired on 94 of 100 questions and deleted 7.5 candidates on average —
     # indiscriminate pruning rather than conflict resolution.
     CONFLICT_MIN_SUBJECT_TERMS = 2
-    # Clusters larger than this are a topic, not a disagreement.
-    CONFLICT_MAX_CLUSTER = 10
+    # Most options to put in one conflict question. A crowded conflict is the case that
+    # matters most, not one to skip: a stale value restated ten ways against one correction
+    # is exactly what makes a generator answer with the stale one. So an oversized cluster
+    # is narrowed to its best-ranked members rather than discarded — discarding it leaves
+    # the majority standing, which measured as the whole of one query's loss.
+    CONFLICT_MAX_CLUSTER = 25
     # Below this, the model is not resolving a conflict: wrong picks came back at 0.40-0.60
     # against about 0.80 for right ones, on a two-to-five option question where confidence
     # is not diluted by the option count the way the pool-wide rank question's is.
@@ -1360,9 +1364,9 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
                 for slot, index in enumerate(batch)
             }
             try:
-                answers = (
-                    await self._ask({"state": self._state(query), "model": self.model, "questions": questions})
-                )["answers"]
+                answers = (await self._ask({"state": self._state(query), "model": self.model, "questions": questions}))[
+                    "answers"
+                ]
             except Exception as e:
                 logger.warning(f"Reranker: TypeSafe pointwise batch failed, keeping its candidates unranked: {e}")
                 return [(0.0, index) for index in batch]
@@ -1581,8 +1585,13 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             ]
             if not peers:
                 continue
+            # Keep the anchor and, when there are more peers than one question can hold,
+            # the best-ranked of them: those are the ones a wrong verdict would cost most.
+            if len(peers) + 1 > self.CONFLICT_MAX_CLUSTER:
+                rank = {index: position for position, index in enumerate(order)}
+                peers = sorted(peers, key=lambda index: rank[index])[: self.CONFLICT_MAX_CLUSTER - 1]
             cluster = tuple(sorted([anchor, *peers]))
-            if 2 <= len(cluster) <= self.CONFLICT_MAX_CLUSTER and cluster not in seen:
+            if len(cluster) >= 2 and cluster not in seen:
                 seen.add(cluster)
                 clusters.append(list(cluster))
         return clusters
@@ -1627,6 +1636,15 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             logger.warning(f"Reranker: TypeSafe conflict resolution failed, keeping every candidate: {e}")
             return set()
 
+        tokens = {index: _normalised_tokens(docs[index]) for index in order}
+        payloads = {index: _value_payload(docs[index]) for index in order}
+        subject = _subject_terms(query)
+        # A verdict reaches beyond its own question, but only to candidates some cluster
+        # already identified as conflicting peers. Reaching the whole pool would widen
+        # deletion on the strength of one answer, and deleting a memory never judged to
+        # conflict with anything is the worse failure for a recall to have.
+        conflicting = {index for cluster in clusters for index in cluster}
+
         superseded: set[int] = set()
         for key, cluster in by_key.items():
             answer = answers.get(key) or {}
@@ -1637,7 +1655,22 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
                 winner = cluster[int(str(choice)[1:])]
             except (ValueError, IndexError):
                 continue
-            superseded.update(index for index in cluster if index != winner)
+            # A confident verdict says which value is current, so everything that disagrees
+            # with the winner on it is stale — not only the candidates that happened to be
+            # in this question. The same value is often restated many times and only some of
+            # those land in one cluster; leaving the rest behind leaves the majority stale,
+            # which is what a generator answers from. The test is the one that built the
+            # cluster, around the winner, so nothing is dropped that would not have been a
+            # peer of it in the first place.
+            superseded.update(
+                index
+                for index in conflicting
+                if index != winner
+                and index not in superseded
+                and payloads[index] != payloads[winner]
+                and _token_overlap(tokens[winner], tokens[index]) >= self.CONFLICT_OVERLAP
+                and (not subject or len(tokens[index] & subject) >= self.CONFLICT_MIN_SUBJECT_TERMS)
+            )
         return superseded
 
     async def _rank_group(self, query: str, docs: list[str], indices: list[int], scores: list[float]) -> None:
