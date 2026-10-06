@@ -2437,8 +2437,9 @@ class TestMentalModelShortCircuitRealLLM:
     The deterministic release-to-auto mechanism is covered by the MockLLM tests
     above. What only a real model can verify is the behaviour *after* release:
     that a real agent, once it is no longer forced, actually answers off a fresh
-    sufficient mental model — and, when the model is fresh but incomplete, that
-    it chooses to retrieve deeper itself with its own targeted query.
+    sufficient mental model — and, when the model is fresh but does not cover the
+    question, that it retrieves deeper itself rather than reporting an absence
+    (#4567).
 
     The search functions are stubbed so the mental-model content is controlled,
     but ``llm_config`` drives the real agent loop.
@@ -2562,6 +2563,90 @@ class TestMentalModelShortCircuitRealLLM:
             ),
             context="A stale mental model claimed the launch was still pending, but the freshly retrieved raw "
             "fact (deploy log A-1029) shows it shipped on Friday. The agent should correct the stale summary.",
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_fresh_but_uncovering_mental_model_digs_instead_of_denying(self, llm_config):
+        """Fresh pages that do not COVER the question must not become a negative answer.
+
+        The regression from #4567: the short-circuit releases the forced lower
+        layers whenever the page search comes back fresh and non-empty, and the
+        "you MUST call recall() before giving up" rule only fires on a search that
+        returns *zero* results. A page that is on the same topic but silent on the
+        question is neither, so nothing made the agent look deeper -- it answered
+        "the bank holds no decision, record or history about X" while recall() on
+        the same bank held the facts. The low/mid depth guidance said as much:
+        stop once the pages give "a reasonable answer".
+
+        **Scope, stated honestly.** This does NOT reproduce the reported
+        incident, and it is not evidence that the guidance works. Measured on two
+        models: on gemini-3.1-flash-lite (what the core-LLM job runs) it passes
+        against the pre-change prompt too, 3 runs out of 3; on 2.5-flash-lite it
+        fails with the change and without it, across three different wordings of
+        the guidance. The incident itself was a capable model (gpt-5.6-luna at
+        effort low) over a 546k-char page set — the size and plausibility of the
+        page payload is the part this five-line fixture cannot stage.
+
+        So this guards the *contract*: that a page which does not state the answer
+        does not end the search. Whether the wording moves a real bank is measured
+        on the reporter's banks in #4567, not here.
+        """
+        functions = self._stub_functions(
+            mental_models=[
+                {
+                    "id": "mm-process",
+                    "name": "Release Process",
+                    "content": (
+                        "Issues in the AURORA project are tracked with keys like AURORA-412. Every change ships "
+                        "behind a feature flag, is reviewed by two engineers, and is released on Thursdays. This "
+                        "page documents the process only and records no status, decision or history for any "
+                        "individual issue."
+                    ),
+                    "relevance": 0.88,
+                    "is_stale": False,
+                }
+            ],
+            recall_memories=[
+                {
+                    "id": "mem-412",
+                    "content": (
+                        "AURORA-412 was closed as fixed on 12 March; the flag was removed in the same release."
+                    ),
+                }
+            ],
+        )
+
+        result = await run_reflect_agent(
+            llm_config=llm_config,
+            bank_id="test-bank",
+            query="Where do we stand on AURORA-412?",
+            bank_profile={"name": "Test", "mission": "Answer from what the bank holds"},
+            has_mental_models=True,
+            include_observations=True,
+            include_recall=True,
+            budget="low",
+            max_iterations=6,
+            **functions,
+        )
+
+        assert result.text, "agent must return a non-empty answer"
+        # The behavioural fix: a page that does not cover the question is not an
+        # answer, so the agent goes to the layer that does instead of denying.
+        assert functions["recall_fn"].await_count > 0, (
+            "the agent answered without calling recall, from a page that holds no status for the issue"
+        )
+        await assert_meets_criteria(
+            response=result.text,
+            criteria=(
+                "The answer reports that AURORA-412 was closed/fixed (on 12 March, and/or that its feature flag "
+                "was removed). It does NOT claim the bank holds nothing, no record, no status or no history for "
+                "AURORA-412."
+            ),
+            context=(
+                "The first search returned only a fresh page about the AURORA release process, which records no "
+                "status for any individual issue. The raw-fact layer holds that AURORA-412 was closed as fixed "
+                "on 12 March."
+            ),
         )
 
 
