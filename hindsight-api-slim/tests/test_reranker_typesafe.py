@@ -247,6 +247,17 @@ class TestCut:
         assert all(score > 0.0 for score in scores)
 
 
+class TestMinKeep:
+    @pytest.mark.asyncio
+    async def test_the_cut_never_keeps_fewer_than_the_floor(self):
+        """Level 0 keeps one; a floor of three keeps the top three by rank."""
+        encoder, _ = _encoder({"c0": 0.1, "c1": 0.4, "c2": 0.3, "c3": 0.2}, cut_level=0.0, prune_candidates=True)
+        encoder.MIN_KEEP = 3
+        scores = await encoder._predict([("q", "a"), ("q", "b"), ("q", "c"), ("q", "d")])
+
+        assert [score > 0 for score in scores] == [False, True, True, True]
+
+
 class TestFactory:
     def test_provider_is_built_from_config(self):
         config = _make_config(

@@ -15075,14 +15075,28 @@ class MemoryEngine(MemoryEngineInterface):
             config = get_config()
             if not config.reranker_typesafe_api_key:
                 return None
-            self._fast_reflect_decision_model = TypeSafeCrossEncoder(
+            model = TypeSafeCrossEncoder(
                 api_key=config.reranker_typesafe_api_key,
                 model=config.reranker_typesafe_model,
                 base_url=config.reranker_typesafe_base_url,
                 timeout=config.reranker_typesafe_timeout,
                 max_concurrent=config.reranker_typesafe_max_concurrent,
+                prune_candidates=True,
             )
+            # The recall cut keeps at most 12; a reflect answer can need more (a count
+            # over seven customers is seven facts plus the observations about them).
+            # The floor guards the cut's coarse levels: on that count it kept five.
+            model.SHORTLIST = 25
+            model.MIN_KEEP = 15
+            self._fast_reflect_decision_model = model
         return self._fast_reflect_decision_model
+
+    async def _prune_reflect_evidence(self, query: str, texts: list[str]) -> list[bool]:
+        """Keep flags for fast reflect's first retrieval: ranked and cut by the decision model."""
+        model = self._reflect_decision_model()
+        assert model is not None  # only wired when a decision model is configured
+        scores = await model.predict([(query, text) for text in texts])
+        return [score > 0.0 for score in scores]
 
     def _llm_for_reflect_operation(self, operation_label: str) -> "LLMConfig | MultiLLMProvider":
         """Pick the LLM for a reflect-pipeline run: interactive, or background refresh.
@@ -15502,6 +15516,9 @@ class MemoryEngine(MemoryEngineInterface):
                             decision_model.evidence_is_sufficient
                             if fast_reflect and (decision_model := self._reflect_decision_model())
                             else None
+                        ),
+                        prune_evidence_fn=(
+                            self._prune_reflect_evidence if fast_reflect and self._reflect_decision_model() else None
                         ),
                     ),
                     timeout=wall_timeout,

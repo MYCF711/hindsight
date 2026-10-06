@@ -1029,6 +1029,11 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     # keeps a handful, so a longer list costs tokens to no purpose.
     SHORTLIST = 12
 
+    # The fewest candidates a cut may keep, by rank. 0 for recall, where the cut is
+    # the whole point; fast reflect raises it, because the cut's levels jump from five
+    # to ten and it picked five for a question whose answer was a count over seven.
+    MIN_KEEP = 0
+
     # Context window safety limit for Jev /v1/systemone.
     # Single question context limit is 32k. A defensive safety margin (26k vs 32k)
     # absorbs cross-tokenizer divergence and JSON envelope formatting overheads.
@@ -1297,6 +1302,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
 
         order = await self._rank(query, docs, indices)
         keep = await self._cut(query, docs, order) if self.prunes_candidates else len(order)
+        keep = max(keep, min(self.MIN_KEEP, len(order)))
         # Positions, not confidences — see the class docstring. Descending from 1.0 so
         # the caller's ordering is preserved, and 0.0 for everything past the cut,
         # which is how prunes_candidates marks a candidate to leave out.

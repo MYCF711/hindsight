@@ -610,6 +610,7 @@ async def _run_reflect_agent_inner(
     tool_token_limits: ReflectToolTokenLimits | None = None,
     fast: bool = False,
     evidence_is_sufficient_fn: Callable[[str, str], Awaitable[bool]] | None = None,
+    prune_evidence_fn: Callable[[str, list[str]], Awaitable[list[bool]]] | None = None,
     *,
     reflect_id: str,
     provider_impl: Any,
@@ -651,6 +652,9 @@ async def _run_reflect_agent_inner(
         evidence_is_sufficient_fn: (question, evidence) -> whether the evidence already
             answers the question. Only consulted in fast mode, once, after the first
             retrieval; without it fast mode hands over to ordinary ``auto`` turns.
+        prune_evidence_fn: (question, candidate texts) -> keep flag per candidate. In
+            fast mode the first retrieval's observations, facts and chunks are pruned
+            with it before the model (or the sufficiency check) reads them.
 
     Returns:
         ReflectAgentResult with final answer and metadata
@@ -1611,6 +1615,17 @@ async def _run_reflect_agent_inner(
             tool_results = await asyncio.gather(*tool_tasks, return_exceptions=True)
             total_tools_called += len(other_tools)
 
+            if fast and iteration == 0 and (budget or "low").lower() != "high":
+                # The agent-mode rule, applied after the fact: fresh, usable pages
+                # answer on their own, so the lower layers that ran alongside them
+                # are not shown. Raw facts next to a page invite the answer to mix in
+                # what the page already superseded.
+                tool_results = _drop_layers_under_fresh_pages(other_tools, tool_results, reflect_id)
+            if fast and iteration == 0 and prune_evidence_fn is not None:
+                prune_start = time.time()
+                tool_results = await _prune_fast_batch(query, tool_results, prune_evidence_fn, reflect_id)
+                llm_trace.append({"scope": "fast_prune", "duration_ms": int((time.time() - prune_start) * 1000)})
+
             # Process results and add to messages
             for position, tc, result_data in zip(allowed_positions, other_tools, tool_results):
                 if isinstance(result_data, OperationCancelledError):
@@ -1748,6 +1763,100 @@ async def _run_reflect_agent_inner(
         f"Reflect exhausted its {max_iterations} iteration(s) without producing an answer "
         f"({total_tools_called} tool call(s) made)."
     )
+
+
+def _drop_layers_under_fresh_pages(
+    tool_calls: list["LLMToolCall"], tool_results: list[Any], reflect_id: str
+) -> list[Any]:
+    """Replace observation and recall results with empty ones when the pages suffice."""
+    pages = next(
+        (
+            result[0]
+            for tc, result in zip(tool_calls, tool_results)
+            if _normalize_tool_name(tc.name) == "search_mental_models" and isinstance(result, tuple)
+        ),
+        None,
+    )
+    if (
+        not isinstance(pages, dict)
+        or not pages.get("mental_models")
+        or not _all_mental_models_are_usable_and_fresh(pages)
+    ):
+        return tool_results
+    logger.info(f"[REFLECT {reflect_id}] Fast mode: fresh pages answer; lower layers not shown.")
+    empty = {"search_observations": {"observations": []}, "recall": {"memories": []}}
+    return [
+        (empty[_normalize_tool_name(tc.name)], result[1])
+        if _normalize_tool_name(tc.name) in empty and isinstance(result, tuple)
+        else result
+        for tc, result in zip(tool_calls, tool_results)
+    ]
+
+
+def _evidence_line(item: dict[str, Any]) -> str:
+    """One fact or observation as the decision model reads it: its date, then its text."""
+    when = item.get("occurred_start") or item.get("mentioned_at")
+    return f"[{when}] {item.get('text', '')}" if when else str(item.get("text", ""))
+
+
+async def _prune_fast_batch(
+    query: str,
+    tool_results: list[Any],
+    prune_evidence_fn: Callable[[str, list[str]], Awaitable[list[bool]]],
+    reflect_id: str,
+) -> list[Any]:
+    """Drop the observations, facts and chunks the decision model judges irrelevant.
+
+    One pool across the whole first retrieval, so the model weighs a fact against an
+    observation saying the same thing. Mental-model pages are left whole: they are
+    few, curated, and already the first thing the answer should read. Source facts
+    survive only under an observation that survived. Results the model did not
+    produce (errors, exceptions) pass through untouched, and so does everything when
+    the decision model fails: pruning only ever saves tokens.
+    """
+    # (result index, list key, item key) for every candidate, in retrieval order.
+    slots: list[tuple[int, str, str]] = []
+    texts: list[str] = []
+    for i, output in enumerate(tool_results):
+        if not isinstance(output, tuple) or not isinstance(output[0], dict) or "error" in output[0]:
+            continue
+        data = output[0]
+        for key in ("observations", "memories"):
+            for item in data.get(key) or []:
+                if isinstance(item, dict) and "id" in item:
+                    slots.append((i, key, str(item["id"])))
+                    texts.append(_evidence_line(item))
+        for chunk_id, chunk in (data.get("chunks") or {}).items():
+            slots.append((i, "chunks", str(chunk_id)))
+            texts.append(str(chunk.get("chunk_text", "")) if isinstance(chunk, dict) else str(chunk))
+    if len(texts) < 2:
+        return tool_results
+    try:
+        keep_flags = await prune_evidence_fn(query, texts)
+    except OperationCancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"[REFLECT {reflect_id}] Fast mode: pruning failed, keeping all evidence: {e}")
+        return tool_results
+
+    kept = {slot for slot, keep in zip(slots, keep_flags) if keep}
+    logger.info(f"[REFLECT {reflect_id}] Fast mode: kept {len(kept)}/{len(slots)} evidence items.")
+    pruned: list[Any] = []
+    for i, output in enumerate(tool_results):
+        if not isinstance(output, tuple) or not isinstance(output[0], dict) or "error" in output[0]:
+            pruned.append(output)
+            continue
+        data = dict(output[0])
+        for key in ("observations", "memories"):
+            if key in data:
+                data[key] = [item for item in data[key] if (i, key, str(item.get("id"))) in kept]
+        if "chunks" in data:
+            data["chunks"] = {cid: c for cid, c in data["chunks"].items() if (i, "chunks", str(cid)) in kept}
+        if "source_facts" in data:
+            cited = {str(fid) for obs in data.get("observations", []) for fid in obs.get("source_fact_ids") or []}
+            data["source_facts"] = {fid: f for fid, f in data["source_facts"].items() if str(fid) in cited}
+        pruned.append((data, output[1]))
+    return pruned
 
 
 def _unique_tool_call_ids(tool_calls: list["LLMToolCall"], already_emitted: set[str]) -> list[str]:
