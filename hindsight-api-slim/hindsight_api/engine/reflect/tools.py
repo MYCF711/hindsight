@@ -7,6 +7,7 @@ Implements hierarchical retrieval:
 3. recall - Raw facts as ground truth
 """
 
+import contextvars
 import json
 import logging
 import uuid
@@ -28,6 +29,14 @@ if TYPE_CHECKING:
     from ..memory_engine import MemoryEngine
 
 logger = logging.getLogger(__name__)
+
+# Set by fast reflect around its first retrieval when a decision model will rank and cut
+# the results: the searches then keep their fused (RRF) order instead of running the
+# cross-encoder. On a local CPU reranker that was 2.7s of a 2.8s search, spent ordering a
+# list the decision model re-orders straight after.
+skip_search_rerank: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hindsight_reflect_skip_search_rerank", default=False
+)
 
 #: Snippet length for a mental-model search hit, matching the knowledge-page search
 #: API's own ``LEFT(content, 280)`` so both surfaces show a page the same way.
@@ -443,6 +452,7 @@ async def tool_search_observations(
         created_before=created_before,
         _connection_budget=1,
         _quiet=True,
+        reranking="rrf" if skip_search_rerank.get() else "cross_encoder",
         **recall_kwargs,
     )
 
@@ -526,6 +536,7 @@ async def tool_recall(
         _quiet=True,  # Suppress logging for internal operations
         include_chunks=include_chunks,
         max_chunk_tokens=max_chunk_tokens,
+        reranking="rrf" if skip_search_rerank.get() else "cross_encoder",
     )
 
     return {

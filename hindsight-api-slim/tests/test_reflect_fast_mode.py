@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from hindsight_api.engine.reflect.agent import run_reflect_agent
-from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult
+from hindsight_api.engine.response_models import LLMCallResult, LLMToolCall, LLMToolCallResult, TokenUsage
 
 
 class _ScriptedProvider:
@@ -191,18 +191,131 @@ async def test_a_failing_pruner_keeps_all_evidence():
     assert '"o"' in evidence and '"m"' in evidence
 
 
-@pytest.mark.asyncio
-async def test_fresh_pages_hide_the_lower_layers():
-    """Agent mode stops at a fresh page; fast mode ran the lower layers anyway and must not show them."""
-    provider = _ScriptedProvider([_done()])
+def _fresh_page_functions() -> dict[str, AsyncMock]:
     functions = _functions()
     functions["search_mental_models_fn"] = AsyncMock(
         return_value={"mental_models": [{"id": "mm-1", "content": "the page", "is_stale": False}]}
     )
+    return functions
+
+
+@pytest.mark.asyncio
+async def test_fresh_pages_that_answer_hide_the_lower_layers():
+    """Pages the decision model says answer alone are read without the facts beside them."""
+    provider = _ScriptedProvider([_done()])
     sufficient = AsyncMock(return_value=True)
 
-    await _reflect(provider, functions, sufficient)
+    result = await _reflect(provider, _fresh_page_functions(), sufficient)
 
-    evidence = sufficient.await_args.args[1]
-    assert "the page" in evidence
-    assert '"o"' not in evidence and '"m"' not in evidence
+    pages_only = sufficient.await_args_list[0].args[1]
+    assert "the page" in pages_only and '"o"' not in pages_only and '"m"' not in pages_only
+    assert sufficient.await_count == 1, "the pages' verdict is the only check needed"
+    assert [c.scope for c in result.llm_trace] == ["fast_pages_sufficiency", "closing_done"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_pages_that_do_not_answer_keep_the_facts():
+    """Fresh is not on topic: pages about the code must not hide a decision in the facts."""
+    provider = _ScriptedProvider([_done()])
+    # No on the pages alone, yes once the facts are in.
+    sufficient = AsyncMock(side_effect=[False, True])
+
+    await _reflect(provider, _fresh_page_functions(), sufficient)
+
+    evidence = sufficient.await_args_list[1].args[1]
+    assert "the page" in evidence and '"o"' in evidence and '"m"' in evidence
+
+
+@pytest.mark.asyncio
+async def test_without_a_decision_model_fresh_pages_hide_nothing():
+    provider = _ScriptedProvider([_done()])
+
+    await _reflect(provider, _fresh_page_functions(), None)
+
+    assert provider.tool_choices == ["auto"]
+
+
+class _QueryWritingProvider(_ScriptedProvider):
+    """Also answers the tool-less call that distills a long request into a search query."""
+
+    def __init__(self, scripted):
+        super().__init__(scripted)
+        self.distill_prompts: list[str] = []
+
+    async def call(self, *, messages, **_):
+        self.distill_prompts.append(messages[-1]["content"])
+        return LLMCallResult(content="Retrier attempt budget", usage=TokenUsage(input_tokens=1, output_tokens=1))
+
+
+@pytest.mark.asyncio
+async def test_a_long_request_is_searched_with_a_distilled_query():
+    """A plugin's 2k-character prompt found nothing and took seconds per search when searched as is."""
+    long_request = "Restore the Retrier attempt budget. " + "Rendering rule: report history only. " * 40
+    provider = _QueryWritingProvider([_done()])
+    functions = _functions()
+
+    result = await run_reflect_agent(
+        llm_config=provider,
+        bank_id="b",
+        query=long_request,
+        bank_profile={"name": "T", "mission": "M"},
+        has_mental_models=True,
+        max_iterations=6,
+        fast=True,
+        evidence_is_sufficient_fn=AsyncMock(return_value=True),
+        **functions,
+    )
+
+    assert provider.distill_prompts == [long_request]
+    for name in ("search_mental_models_fn", "search_observations_fn", "recall_fn"):
+        assert functions[name].await_args.args[0] == "Retrier attempt budget"
+    assert [c.scope for c in result.llm_trace][0] == "fast_query"
+
+
+@pytest.mark.asyncio
+async def test_a_short_question_is_searched_as_written():
+    provider = _QueryWritingProvider([_done()])
+    functions = _functions()
+
+    await _reflect(provider, functions, AsyncMock(return_value=True))
+
+    assert provider.distill_prompts == []
+    assert functions["recall_fn"].await_args.args[0] == "where does Alice live?"
+
+
+@pytest.mark.asyncio
+async def test_the_first_batch_skips_the_search_reranker_only_when_the_decision_model_prunes():
+    """The decision model re-ranks the first batch; a cross-encoder pass before it is wasted time."""
+    from hindsight_api.engine.reflect.tools import skip_search_rerank
+
+    seen: list[bool] = []
+
+    async def recall(query, *args):
+        seen.append(skip_search_rerank.get())
+        return {"memories": [{"id": "mem-1", "text": "m"}]}
+
+    follow_up = LLMToolCallResult(
+        tool_calls=[LLMToolCall(id="r", name="recall", arguments={"query": "follow-up"})],
+        finish_reason="tool_calls",
+    )
+    for prune, expected in (
+        (AsyncMock(side_effect=lambda q, texts: [True] * len(texts)), [True, False]),
+        (None, [False, False]),
+    ):
+        seen.clear()
+        functions = _functions()
+        functions["recall_fn"] = AsyncMock(side_effect=recall)
+        await run_reflect_agent(
+            llm_config=_ScriptedProvider([follow_up, _done()]),
+            bank_id="b",
+            query="q",
+            bank_profile={"name": "T", "mission": "M"},
+            has_mental_models=True,
+            max_iterations=6,
+            fast=True,
+            evidence_is_sufficient_fn=AsyncMock(return_value=False),
+            prune_evidence_fn=prune,
+            **functions,
+        )
+        # The first batch, then the agent's own follow-up search, which always reranks.
+        assert seen == expected

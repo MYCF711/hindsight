@@ -960,6 +960,16 @@ def build_done_request_prompt(
 #: mandatory because conflicting facts can land in different chunks: only the
 #: reduce call sees every chunk's claims, and it needs each claim's
 #: ``mentioned_at`` to apply the latest-statement-wins supersession rule.
+# Fast reflect: a request too long to search with as written (a plugin's prompt wraps the
+# developer's goal in rendering rules) is first turned into one short search query.
+FAST_SEARCH_QUERY_SYSTEM_PROMPT = (
+    "You write search queries for a memory bank. Given a request, reply with ONE short search "
+    "query (at most 12 words) naming what the request needs to find: the subject, component, "
+    "decision or values it is about. Ignore instructions about how to format an answer. "
+    "Reply with the query only, no quotes."
+)
+
+
 CLAIMS_SYSTEM_PROMPT = (
     "You extract evidence from retrieved memory data. You MUST ONLY use information "
     "from the provided data. NEVER make up names, people, events, or entities.\n\n"

@@ -34,6 +34,7 @@ from .presentation import ToolResultPresenter
 from .prompts import (
     _SPLIT_SYNTHESIS_WARN_CHUNKS,
     CLAIMS_SYSTEM_PROMPT,
+    FAST_SEARCH_QUERY_SYSTEM_PROMPT,
     _extract_directive_rules,
     build_agent_user_prompt,
     build_chunk_claims_prompt,
@@ -52,6 +53,7 @@ from .structured_doc import (
     render_document,
 )
 from .tokenization import count_prompt_tokens
+from .tools import skip_search_rerank
 from .tools_schema import get_reflect_tools
 
 #: Bounds on any token argument the model supplies to a retrieval tool. Below the
@@ -147,6 +149,11 @@ if TYPE_CHECKING:
     from ..response_models import TokenUsage
 
 logger = logging.getLogger(__name__)
+
+# Fast reflect searches with a request as written up to this size; longer ones are distilled
+# into a short query first. ponytail: a token count stands in for "is this a question or a
+# prompt"; a request just under it that is still mostly instructions searches poorly.
+_FAST_QUERY_MAX_TOKENS = 80
 
 DEFAULT_MAX_ITERATIONS = 10
 _COMPACTED_TOOL_RESULT = "[Earlier tool result omitted to fit the context budget; it is kept for the final answer.]"
@@ -1164,6 +1171,40 @@ async def _run_reflect_agent_inner(
             directives_applied=directives_applied,
         )
 
+    async def _decision_says_sufficient(evidence: str, trace_scope: str) -> bool:
+        """The decision model's verdict on ``evidence``; False when it errors.
+
+        The decision model only ever saves LLM turns, and without its verdict the agent
+        turns still answer, so its outage must not fail reflect.
+        """
+        assert evidence_is_sufficient_fn is not None
+        decision_start = time.time()
+        try:
+            # Judged against the request itself, not the distilled search query: that query is
+            # a retrieval aid and can ask for more than the request does ("implementation logic
+            # and policy"), which read as "partly answered" on evidence the request was happy with.
+            return await evidence_is_sufficient_fn(query, evidence)
+        except OperationCancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[REFLECT {reflect_id}] Fast mode: decision model failed, using agent turns: {e}")
+            return False
+        finally:
+            llm_trace.append({"scope": trace_scope, "duration_ms": int((time.time() - decision_start) * 1000)})
+
+    async def _timed_prune(tool_results: list[Any]) -> list[Any]:
+        """Fast mode's first retrieval, pruned by the decision model when there is one."""
+        if prune_evidence_fn is None:
+            return tool_results
+        prune_start = time.time()
+        pruned = await _prune_fast_batch(fast_search_query, tool_results, prune_evidence_fn, reflect_id)
+        llm_trace.append({"scope": "fast_prune", "duration_ms": int((time.time() - prune_start) * 1000)})
+        return pruned
+
+    # Fast mode's first-retrieval query, and whether the pages alone answered it.
+    fast_search_query = query
+    fast_pages_answered = False
+
     consecutive_errors = 0
     # When a forced ``search_mental_models`` returns fresh, usable models on a
     # low/mid-budget call, we stop forcing the lower retrieval layers for the
@@ -1204,20 +1245,11 @@ async def _run_reflect_agent_inner(
         # that evidence already answers the question. Yes ends retrieval here, so the
         # only LLM call left is the answer itself; no hands over to ordinary ``auto``
         # turns, where the LLM writes follow-up queries from what it has read.
+        if fast and iteration == 1 and fast_pages_answered:
+            return await _finish(iteration)
         if fast and iteration == 1 and evidence_is_sufficient_fn is not None:
             evidence = "\n\n".join(m["content"] for m in messages if m.get("role") == "tool")
-            decision_start = time.time()
-            try:
-                sufficient = await evidence_is_sufficient_fn(query, evidence)
-            except OperationCancelledError:
-                raise
-            except Exception as e:
-                # The decision model only ever saves LLM turns; without its verdict
-                # the agent turns below still answer, so its outage must not fail reflect.
-                logger.warning(f"[REFLECT {reflect_id}] Fast mode: decision model failed, using agent turns: {e}")
-                sufficient = False
-            llm_trace.append({"scope": "fast_sufficiency", "duration_ms": int((time.time() - decision_start) * 1000)})
-            if sufficient:
+            if await _decision_says_sufficient(evidence, "fast_sufficiency"):
                 logger.info(f"[REFLECT {reflect_id}] Fast mode: the first retrieval answers the question.")
                 return await _finish(iteration)
 
@@ -1298,13 +1330,23 @@ async def _run_reflect_agent_inner(
 
         call_msg_count = len(messages)
         if fast and iteration == 0 and forced_sequence:
-            # Fast mode: every forced layer at once, with the question itself as the
-            # query. In agent mode each of these is a full LLM round trip whose only
-            # output is a search string; the theory that later layers need queries
-            # written from earlier results is what this mode puts to the test.
+            # Fast mode: every forced layer at once, with one query. In agent mode each of
+            # these is a full LLM round trip whose only output is a search string.
+            #
+            # A short question is searched as written (the system evals pass that way). A
+            # long request is not: a plugin wraps the developer's goal in ~2k characters
+            # of rendering rules, and searching with all of it found nothing and took 4-7s
+            # per arm (sde-bench boltons-budget). One small LLM call distills it first.
+            if count_prompt_tokens(query) > _FAST_QUERY_MAX_TOKENS:
+                distilled = await _tracked_llm_call(
+                    query, "fast_query", FAST_SEARCH_QUERY_SYSTEM_PROMPT, None, temperature=0.0
+                )
+                fast_search_query = distilled.strip().strip('"') or query
             result = LLMToolCallResult(
                 tool_calls=[
-                    LLMToolCall(id=f"fast_{tool}", name=tool, arguments={"query": query, "reason": "fast mode"})
+                    LLMToolCall(
+                        id=f"fast_{tool}", name=tool, arguments={"query": fast_search_query, "reason": "fast mode"}
+                    )
                     for tool in forced_sequence
                 ],
                 finish_reason="tool_calls",
@@ -1612,19 +1654,42 @@ async def _run_reflect_agent_inner(
                 )
                 for tc in other_tools
             ]
-            tool_results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+            # Fast mode's first batch is ranked and cut by the decision model, so the searches
+            # skip their own reranker (see tools.skip_search_rerank).
+            rerank_token = skip_search_rerank.set(fast and iteration == 0 and prune_evidence_fn is not None)
+            try:
+                tool_results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+            finally:
+                skip_search_rerank.reset(rerank_token)
             total_tools_called += len(other_tools)
 
-            if fast and iteration == 0 and (budget or "low").lower() != "high":
-                # The agent-mode rule, applied after the fact: fresh, usable pages
-                # answer on their own, so the lower layers that ran alongside them
-                # are not shown. Raw facts next to a page invite the answer to mix in
-                # what the page already superseded.
-                tool_results = _drop_layers_under_fresh_pages(other_tools, tool_results, reflect_id)
-            if fast and iteration == 0 and prune_evidence_fn is not None:
-                prune_start = time.time()
-                tool_results = await _prune_fast_batch(query, tool_results, prune_evidence_fn, reflect_id)
-                llm_trace.append({"scope": "fast_prune", "duration_ms": int((time.time() - prune_start) * 1000)})
+            if (
+                fast
+                and iteration == 0
+                and (budget or "low").lower() != "high"
+                and evidence_is_sufficient_fn is not None
+                and (pages := _fresh_usable_pages(other_tools, tool_results)) is not None
+            ):
+                # Raw facts next to a page invite the answer to mix in what the page already
+                # superseded, so pages that answer on their own are read alone. "Fresh" is not
+                # "on topic": a coding bank's pages describe the code, and hiding the facts
+                # behind them on freshness alone hid the one decision that mattered
+                # (sde-bench boltons-budget). The decision model reads the pages first.
+                # The pruning runs alongside the pages' verdict rather than after it: both are
+                # decision-model calls, and pruning work thrown away when the pages answer costs
+                # less than waiting for one before starting the other.
+                pages_answer, pruned = await asyncio.gather(
+                    _decision_says_sufficient(json.dumps(pages, default=str), "fast_pages_sufficiency"),
+                    _timed_prune(tool_results),
+                )
+                if pages_answer:
+                    logger.info(f"[REFLECT {reflect_id}] Fast mode: the pages answer; lower layers not shown.")
+                    tool_results = _hide_lower_layers(other_tools, tool_results)
+                    fast_pages_answered = True
+                else:
+                    tool_results = pruned
+            elif fast and iteration == 0:
+                tool_results = await _timed_prune(tool_results)
 
             # Process results and add to messages
             for position, tc, result_data in zip(allowed_positions, other_tools, tool_results):
@@ -1765,10 +1830,8 @@ async def _run_reflect_agent_inner(
     )
 
 
-def _drop_layers_under_fresh_pages(
-    tool_calls: list["LLMToolCall"], tool_results: list[Any], reflect_id: str
-) -> list[Any]:
-    """Replace observation and recall results with empty ones when the pages suffice."""
+def _fresh_usable_pages(tool_calls: list["LLMToolCall"], tool_results: list[Any]) -> dict[str, Any] | None:
+    """The page search's output when every page in it is fresh and has text, else None."""
     pages = next(
         (
             result[0]
@@ -1777,13 +1840,13 @@ def _drop_layers_under_fresh_pages(
         ),
         None,
     )
-    if (
-        not isinstance(pages, dict)
-        or not pages.get("mental_models")
-        or not _all_mental_models_are_usable_and_fresh(pages)
-    ):
-        return tool_results
-    logger.info(f"[REFLECT {reflect_id}] Fast mode: fresh pages answer; lower layers not shown.")
+    if isinstance(pages, dict) and pages.get("mental_models") and _all_mental_models_are_usable_and_fresh(pages):
+        return pages
+    return None
+
+
+def _hide_lower_layers(tool_calls: list["LLMToolCall"], tool_results: list[Any]) -> list[Any]:
+    """Replace the observation and recall results with empty ones."""
     empty = {"search_observations": {"observations": []}, "recall": {"memories": []}}
     return [
         (empty[_normalize_tool_name(tc.name)], result[1])

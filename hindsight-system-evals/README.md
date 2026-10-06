@@ -148,6 +148,34 @@ rank the sources. The ways an operator can state the precedence with no new conf
 `HINDSIGHT_EVAL_SOURCE_STRATEGY`. It uses `hindsight_system_evals/sources.py`,
 not the shared corpus.
 
+**`test_09` — a coding agent's first-prompt reflect, in both reflect modes.** The only suite on
+a bank shaped like a coding agent's: one sde-bench task (`boltons-budget-001`) as the
+coding-agents plugin ingests it — the task repo's history, the one chat where the decision
+was made, 140 decoy developer conversations, and the pages the plugin wrote about the code.
+It sends the plugin's own first-prompt request (`buildReflectQuery`, the developer's goal
+wrapped in ~2k characters of rendering rules) in `agent` and `fast` reflect mode on the same
+bank, interleaved, `HINDSIGHT_EVAL_CODING_REFLECT_REPEATS` times each (default 3). Every
+answer must report the decided `MAX_ATTEMPTS = 7` with its rationale, and must not say the
+bank holds no decision; fast mode must also be faster (median) and make fewer LLM calls.
+
+Behind it: fast reflect passed every suite above and still injected "the bank holds no
+decision" on sde-bench, in 14s against agent mode's 7-10s. The wrapped prompt was the search
+query, fresh pages about the code hid the facts, and the decision model's "partly" was a
+rounding of a "fully". None of that shows on short questions over an on-topic corpus. The
+speed check needs a decision model (`HINDSIGHT_EVAL_SET_RERANKER_TYPESAFE_API_KEY`); without
+one the answers are still graded and the speed check is skipped.
+
+The bank is `fixtures/coding-agent-bank.zip`, with its provenance and the task's goal in
+`fixtures/coding-agent-bank.json`. Rebuild it on purpose, against a server you keep up, with
+sde-bench's own setup (`SDE_HSCODING_PLUGIN_DIR` at a built plugin, `SDEBENCH_BOLTONS_HOST`
+at a boltons clone, `OMB_ANSWER_LLM`/`OMB_JUDGE_LLM` set to a provider you have a key for):
+
+```bash
+uv run run-amb --api-url http://localhost:8888 --dataset sdebench --split boltons \
+  --memory hindsight-coding -- --mode coding --query-id boltons-budget-001 --skip-answer
+# then export bank sde-coding-boltons-budget-001 with export_bank into fixtures/
+```
+
 **`test_08` — ranked retrieval on BEIR.** The only suite graded against labels
 nobody here wrote, and the only one that makes **no model call**. It records a
 *baseline*: what this pipeline scores on a public IR benchmark, and on what.

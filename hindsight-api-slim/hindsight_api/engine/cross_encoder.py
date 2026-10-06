@@ -1246,7 +1246,16 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
                 },
             }
         )
-        level = round(float(result["answers"]["sufficient"]["score"]))
+        answer = result["answers"]["sufficient"]
+        # The most likely level, not the rounded expected score: an expected 1.43 is "partly" when
+        # rounded, though "fully" was the likeliest verdict at 0.54 (sde-bench boltons-budget), and
+        # every such rounding cost two LLM turns. The score is the fallback for a reply without
+        # per-level probabilities.
+        probabilities = answer.get("probabilities")
+        if probabilities:
+            level = int(max(probabilities, key=lambda key: float(probabilities[key])))
+        else:
+            level = round(float(answer["score"]))
         return level >= len(self.SUFFICIENCY_LEVELS) - 1
 
     async def _cut(self, query: str, docs: list[str], order: list[int]) -> int:
