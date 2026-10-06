@@ -1214,12 +1214,15 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     ]
     CUT_DEPTHS = [1, 2, 3, 5, 10, None]  # None keeps the whole shortlist
 
-    # Textual overlap above which two candidates are restatements of each other — unless
-    # their value payload differs, in which case they are never duplicates however much
-    # text they share. Normalising by the shorter candidate once deleted a 16-token
-    # correction that shared 14 tokens with the claim it corrects: at 0.875 overlap it
-    # looked like a duplicate, and the one token they differed on was the answer.
-    DUPLICATE_OVERLAP = 0.85
+    # There is deliberately no text-overlap de-duplication here. It was carried over from
+    # the pipeline this was ported from and measured as pure loss: overlap is a guess about
+    # what a candidate says, not a judgement that it is untrue, and it read a standing
+    # instruction phrased like its neighbours as a restatement of them. Removing a candidate
+    # on that basis cost 0.040 of 0.67 over 100 questions — the whole difference between the
+    # two pipelines — and 7 of the 11 questions that differed came back right without it.
+    # Demoting instead of deleting does not help either: the caller's budget cuts from the
+    # back, so moving a candidate there removes it just the same. Supersession below is the
+    # only thing that takes a candidate out, and it does so on an explicit verdict.
 
     # Overlap at which two candidates are "the same thing with a different value". There is
     # deliberately no upper bound: the pairs that most need resolving are the ones that
@@ -1532,25 +1535,6 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         "answer? When they conflict, the most recently stated value supersedes the earlier one."
     )
 
-    def _duplicates(self, docs: list[str], order: list[int]) -> set[int]:
-        """Restatements of a higher-ranked candidate — never one that disagrees on a value."""
-        dropped: set[int] = set()
-        kept: list[tuple[set[str], tuple[frozenset[int], frozenset[str]]]] = []
-        for index in order:
-            tokens = _normalised_tokens(docs[index])
-            payload = _value_payload(docs[index])
-            for previous_tokens, previous_payload in kept:
-                if _token_overlap(tokens, previous_tokens) <= self.DUPLICATE_OVERLAP:
-                    continue
-                # Textually near-identical. A duplicate only if they also AGREE on the values.
-                if payload != previous_payload:
-                    continue
-                dropped.add(index)
-                break
-            else:
-                kept.append((tokens, payload))
-        return dropped
-
     def _conflict_clusters(self, query: str, docs: list[str], order: list[int]) -> list[list[int]]:
         """Candidates that overlap heavily but disagree on a value, grouped around each anchor.
 
@@ -1693,17 +1677,15 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         else:
             order = await self._rank(query, docs, indices)
         if self._resolves_conflicts:
-            # Restatements go first: a cluster of five ways of saying the stale value is one
-            # conflict, and resolving it five times spends five questions on one answer.
-            dropped = self._duplicates(docs, order)
-            remaining = [index for index in order if index not in dropped]
-            dropped |= await self._superseded(query, docs, remaining)
-            kept = [index for index in order if index not in dropped]
+            # Only a conflict the model settled confidently removes anything.
+            superseded = await self._superseded(query, docs, order)
+            kept = [index for index in order if index not in superseded]
             # Never return nothing. One candidate the caller can dismiss beats silence,
             # same reasoning as the cut's missing "nothing is relevant" level.
             order = kept or order[:1]
-            # Anything dropped keeps the 0.0 it started with, which prunes_candidates
+            # The superseded keep the 0.0 they started with, which prunes_candidates
             # tells the caller to leave out.
+
         keep = await self._cut(query, docs, order) if self._prunes_by_cut else len(order)
         # Positions, not confidences — see the class docstring. Descending from 1.0 so
         # the caller's ordering is preserved, and 0.0 for everything past the cut,

@@ -460,14 +460,14 @@ class TestSharedPreamble:
         asked = [q["instructions"]["memory"] for q in session.posted[0]["questions"].values()]
         assert asked == ["The deadline is April 5", "The team chose Postgres"]
 
-    def test_candidates_are_not_duplicates_once_the_preamble_is_gone(self):
+    def test_the_preamble_does_not_make_unrelated_candidates_conflict(self):
         """With it left in, 60 tokens of shared boilerplate put any two candidates over the
-        overlap threshold and dedupe reads them as restatements of each other."""
+        overlap threshold, and two unrelated facts read as a disagreement."""
         encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
-        with_preamble = [f"{self.PROFILE}\nalpha one", f"{self.PROFILE}\nbeta two"]
-        assert encoder._duplicates(with_preamble, [0, 1]) == {1}
-        own = _strip_shared_prefix(with_preamble, [0, 1])
-        assert encoder._duplicates([own[0], own[1]], [0, 1]) == set()
+        own = _strip_shared_prefix(
+            [f"{self.PROFILE}\nThe deadline is April 5, 2024", f"{self.PROFILE}\nThe team chose Postgres"], [0, 1]
+        )
+        assert encoder._conflict_clusters("What is the deadline?", [own[0], own[1]], [0, 1]) == []
 
 
 class TestConflictResolution:
@@ -520,6 +520,17 @@ class TestConflictResolution:
         assert scores[0] == 0.0, "the superseded candidate must be pruned, not ranked lower"
         assert scores[1] > 0.0
         assert encoder.prunes_candidates is True
+
+    async def test_a_restatement_is_demoted_not_deleted(self):
+        """Overlap is a guess about what a candidate says, not a judgement that it is untrue,
+        and it reads a standing instruction phrased like its neighbours as a restatement of
+        them. Deleting on that basis cost real evidence; the caller's budget cuts from the
+        back, so demoting still keeps restatements out of the answer."""
+        encoder, _ = self._encoder(choice=None, confidence=0.0)
+        restatement = f"{self.STALE}, as agreed"
+        scores = await encoder._predict([(self.QUERY, self.STALE), (self.QUERY, restatement)])
+        assert all(score > 0.0 for score in scores), "a restatement must not be pruned"
+        assert scores[0] > scores[1], "it belongs behind the one it restates"
 
     @pytest.mark.asyncio
     async def test_a_hedged_verdict_drops_nothing(self):
@@ -576,15 +587,11 @@ class TestConflictResolution:
         scores = await encoder._predict(self._pairs)
         assert all(score > 0.0 for score in scores)
 
-    def test_a_terse_correction_is_not_a_duplicate_of_what_it_corrects(self):
-        """Normalising overlap by the shorter candidate put this pair at 0.875, and the one
-        token they differ on is the answer."""
+    def test_a_terse_correction_conflicts_with_what_it_corrects(self):
+        """They overlap on almost every token and differ on one number: that is the pair
+        supersession exists to settle, so it has to reach the question."""
         encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
-        assert encoder._duplicates([self.STALE, self.CURRENT], [0, 1]) == set()
-
-    def test_a_restatement_that_agrees_on_the_values_is_a_duplicate(self):
-        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
-        assert encoder._duplicates([self.STALE, self.STALE + ", as agreed"], [0, 1]) == {1}
+        assert encoder._conflict_clusters(self.QUERY, [self.STALE, self.CURRENT], [0, 1]) == [[0, 1]]
 
     @pytest.mark.asyncio
     async def test_a_confident_verdict_reaches_every_stale_restatement(self):
@@ -626,10 +633,10 @@ class TestDateIsMetadataNotContent:
 
     DATE = "[Date: June 05, 2024 (2024-06-05)] "
 
-    def test_two_candidates_sharing_a_date_are_not_duplicates(self):
-        encoder = TypeSafeCrossEncoder(api_key="k")
+    def test_two_candidates_sharing_a_date_do_not_conflict_because_of_it(self):
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
         docs = [f"{self.DATE}The team chose Postgres for storage", f"{self.DATE}The deadline moved to April 5"]
-        assert encoder._duplicates(docs, [0, 1]) == set()
+        assert encoder._conflict_clusters("What is the deadline?", docs, [0, 1]) == []
 
     def test_the_dates_digits_stay_out_of_the_value_payload(self):
         """Otherwise 2024 and 06 read as the numbers the question turns on."""
