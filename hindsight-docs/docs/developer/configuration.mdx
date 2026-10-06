@@ -1181,7 +1181,8 @@ ZeroEntropy's `zembed-1` supports Matryoshka dimensions: `2560`, `1280`, `640`, 
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, `cohere`, `openrouter`, `zeroentropy`, `siliconflow`, `typesafe`, `alibaba`, `google`, `flashrank`, `litellm`, `litellm-sdk`, `jina-mlx`, or `rrf` | `local` |
+| `HINDSIGHT_API_RERANKER_TYPE` | Which kind of reranker this server runs: `cross_encoder` or `decision_model`. The type picks the default provider, and every member of a fallback chain has to serve it — a mismatch fails at startup. Leave it unset and the type is taken from the provider, so a configuration written before the type existed keeps working. | `cross_encoder` |
+| `HINDSIGHT_API_RERANKER_PROVIDER` | Who serves the type. `cross_encoder`: `local`, `tei`, `cohere`, `openrouter`, `zeroentropy`, `siliconflow`, `alibaba`, `google`, `flashrank`, `litellm`, `litellm-sdk`, `jina-mlx`. `decision_model`: `typesafe`. `rrf` (the passthrough) serves either. | `local`, or `typesafe` when the type is `decision_model` |
 | `HINDSIGHT_API_RERANKER_MAX_RETRIES` | Retries after the first attempt when a remote rerank call fails transiently (5xx, timeout, connection error, `429` quota). `0` disables retrying. Applies to every remote provider except `tei`, which has its own retry loop; the in-process providers (`local`, `flashrank`, `jina-mlx`, `rrf`) are unaffected. 4xx auth/validation errors are never retried. | `3` |
 | `HINDSIGHT_API_RERANKER_INITIAL_BACKOFF` | Initial backoff in seconds between rerank retries (doubles per attempt, with jitter) | `0.5` |
 | `HINDSIGHT_API_RERANKER_MAX_BACKOFF` | Cap on the backoff between rerank retries, in seconds | `4.0` |
@@ -1470,10 +1471,18 @@ memory is wasted context.
 provider therefore hands back rank positions, and exactly `0.0` for anything past the
 cut.
 
-**A decision model, not a cross-encoder.** A cross-encoder scores each candidate alone, so
-recall corrects its scores with recency, temporal-proximity, proof-count and strategy
-boosts. TypeSafe ranks the whole pool in one judgement, so its order is final and those
-boosts are skipped. Preferences are written as ranking rules instead, in plain words, with
+**A decision model, not a cross-encoder.** These are two reranker types, chosen with
+`HINDSIGHT_API_RERANKER_TYPE`:
+
+```bash
+# a decision model; the provider defaults to typesafe
+export HINDSIGHT_API_RERANKER_TYPE=decision_model
+export HINDSIGHT_API_RERANKER_TYPESAFE_API_KEY=...
+```
+
+A cross-encoder scores each candidate alone, so recall corrects its scores with recency,
+temporal-proximity, proof-count and strategy boosts. A decision model ranks the whole pool
+in one judgement, so its order is final and those boosts are skipped. Preferences are written as ranking rules instead, in plain words, with
 `HINDSIGHT_API_RERANKER_INSTRUCTIONS` (overridable per bank as `reranker_instructions`).
 The default restates what the boosts did:
 

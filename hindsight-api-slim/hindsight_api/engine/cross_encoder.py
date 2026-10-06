@@ -20,6 +20,7 @@ import aiohttp
 
 from .._cross_loop import CrossLoopSemaphore
 from ..config import (
+    DECISION_MODEL_PROVIDERS,
     DEFAULT_LITELLM_API_BASE,
     DEFAULT_RERANKER_ALIBABA_MODEL,
     DEFAULT_RERANKER_COHERE_MODEL,
@@ -78,7 +79,7 @@ _served_provider: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # fixed floor just keeps a fixed share of the pool and the value is not comparable
 # between recalls (#4901). Recall rejects min_scores.reranker for these and
 # publishes no reranker score.
-DECISION_PROVIDERS = frozenset({"typesafe"})
+DECISION_PROVIDERS = DECISION_MODEL_PROVIDERS
 
 # The bank's ranking rules for the rerank running in this task, read by decision
 # providers. Set by CrossEncoderReranker.rerank(); cross-encoders ignore it.
@@ -2447,7 +2448,37 @@ def create_cross_encoder_from_env() -> CrossEncoderModel:
     """
     from ..config import get_config
 
-    chain = get_config().reranker_chain()
+    config = get_config()
+    chain = config.reranker_chain()
+    _check_chain_serves_type(config.reranker_type, chain)
     if len(chain) == 1:
         return create_cross_encoder(chain[0])
     return MultiCrossEncoder([create_cross_encoder(member) for member in chain])
+
+
+def _check_chain_serves_type(reranker_type: str, chain: list[RerankerMemberConfig]) -> None:
+    """Every member of the chain has to serve the configured type.
+
+    A chain that mixed the two kinds would score some recalls with the boosts and some
+    without, depending on which member happened to answer, and ``min_scores.reranker``
+    would be accepted or rejected by the same accident. Failing at startup names the
+    member, because a chain misconfiguration is otherwise only visible in the scores.
+    """
+    from ..config import ENV_RERANKER_TYPE, PROVIDERS_BY_RERANKER_TYPE, reranker_type_of_provider
+
+    if reranker_type not in PROVIDERS_BY_RERANKER_TYPE:
+        # No type declared (a config built field by field rather than from the
+        # environment). Take the primary's own type, so a chain is still checked
+        # for mixing kinds; nothing to check at all if even that is unknown.
+        reranker_type = reranker_type_of_provider(chain[0].provider) or ""
+        if reranker_type not in PROVIDERS_BY_RERANKER_TYPE:
+            return
+    allowed = PROVIDERS_BY_RERANKER_TYPE[reranker_type]
+    for member in chain:
+        provider = member.provider.lower()
+        if provider not in allowed:
+            raise ValueError(
+                f"{member.env_name('PROVIDER')} is {provider!r}, which does not serve "
+                f"{ENV_RERANKER_TYPE}={reranker_type!r}. "
+                f"Providers for that type: {', '.join(sorted(allowed))}"
+            )

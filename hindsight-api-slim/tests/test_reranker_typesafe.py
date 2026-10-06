@@ -319,6 +319,78 @@ class TestFactory:
         assert session.urls == ["https://proxy.example.com/v1/systemone"]
 
 
+class TestRerankerType:
+    """The reranker type is what an operator picks; the provider says who serves it."""
+
+    @staticmethod
+    def _env(monkeypatch, **env):
+        for name in (
+            "HINDSIGHT_API_RERANKER_TYPE",
+            "HINDSIGHT_API_RERANKER_PROVIDER",
+            "HINDSIGHT_API_RERANKER_1_PROVIDER",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        return HindsightConfig.from_env()
+
+    def test_the_type_alone_picks_the_provider(self, monkeypatch):
+        """One env var is enough: the type's own default provider serves it."""
+        config = self._env(monkeypatch, HINDSIGHT_API_RERANKER_TYPE="decision_model")
+        assert config.reranker_type == "decision_model"
+        assert config.reranker_provider == "typesafe"
+
+    def test_the_provider_alone_still_picks_the_type(self, monkeypatch):
+        """How this was configured before the type existed, so it has to keep working."""
+        config = self._env(monkeypatch, HINDSIGHT_API_RERANKER_PROVIDER="typesafe")
+        assert config.reranker_type == "decision_model"
+
+    def test_the_default_is_a_cross_encoder(self, monkeypatch):
+        config = self._env(monkeypatch)
+        assert config.reranker_type == "cross_encoder"
+        assert config.reranker_provider == "local"
+
+    def test_an_unknown_type_names_the_ones_there_are(self, monkeypatch):
+        with pytest.raises(ValueError, match="cross_encoder, decision_model"):
+            self._env(monkeypatch, HINDSIGHT_API_RERANKER_TYPE="llm")
+
+    def test_a_provider_that_does_not_serve_the_type_is_refused(self, monkeypatch):
+        """Mismatched, this would score some recalls with the boosts and some without."""
+        config = self._env(
+            monkeypatch,
+            HINDSIGHT_API_RERANKER_TYPE="cross_encoder",
+            HINDSIGHT_API_RERANKER_PROVIDER="typesafe",
+        )
+        with patch("hindsight_api.config.get_config", return_value=config):
+            with pytest.raises(ValueError, match="does not serve HINDSIGHT_API_RERANKER_TYPE"):
+                create_cross_encoder_from_env()
+
+    def test_a_fallback_of_the_other_kind_is_refused(self, monkeypatch):
+        """A chain may not mix kinds: which member answered would decide the scoring."""
+        config = self._env(
+            monkeypatch,
+            HINDSIGHT_API_RERANKER_TYPE="decision_model",
+            HINDSIGHT_API_RERANKER_TYPESAFE_API_KEY="k",
+            HINDSIGHT_API_RERANKER_1_PROVIDER="cohere",
+            HINDSIGHT_API_RERANKER_1_COHERE_API_KEY="k",
+        )
+        with patch("hindsight_api.config.get_config", return_value=config):
+            with pytest.raises(ValueError, match="HINDSIGHT_API_RERANKER_1_PROVIDER"):
+                create_cross_encoder_from_env()
+
+    def test_a_passthrough_fallback_serves_either_kind(self, monkeypatch):
+        """rrf does no ranking, so it is a valid last member of either chain."""
+        config = self._env(
+            monkeypatch,
+            HINDSIGHT_API_RERANKER_TYPE="decision_model",
+            HINDSIGHT_API_RERANKER_TYPESAFE_API_KEY="k",
+            HINDSIGHT_API_RERANKER_1_PROVIDER="rrf",
+        )
+        with patch("hindsight_api.config.get_config", return_value=config):
+            encoder = create_cross_encoder_from_env()
+        assert encoder.primary_provider_name == "typesafe"
+
+
 class TestTokenBudgetingAndOrder:
     @pytest.mark.asyncio
     async def test_single_round_fast_path_when_pool_fits(self):

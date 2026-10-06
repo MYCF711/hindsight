@@ -596,6 +596,7 @@ ENV_RERANKER_LITELLM_SDK_API_BASE = "HINDSIGHT_API_RERANKER_LITELLM_SDK_API_BASE
 ENV_LITELLM_API_BASE = "HINDSIGHT_API_LITELLM_API_BASE"
 ENV_LITELLM_API_KEY = "HINDSIGHT_API_LITELLM_API_KEY"
 
+ENV_RERANKER_TYPE = "HINDSIGHT_API_RERANKER_TYPE"
 ENV_RERANKER_PROVIDER = "HINDSIGHT_API_RERANKER_PROVIDER"
 ENV_RERANKER_SEND_BANK_AS_HEADER = "HINDSIGHT_API_RERANKER_SEND_BANK_AS_HEADER"
 ENV_RERANKER_LOCAL_MODEL = "HINDSIGHT_API_RERANKER_LOCAL_MODEL"
@@ -1278,7 +1279,52 @@ DEFAULT_EMBEDDINGS_GEMINI_FORCE_IPV4 = False
 DEFAULT_EMBEDDINGS_GEMINI_BATCH_SIZE = 100
 DEFAULT_EMBEDDING_DIMENSION = 384
 
+# The two reranker types, and the providers that serve each. The type is what an operator
+# picks; the provider then says who serves it.
+#
+# A decision model ranks the whole pool in one judgement, guided by the bank's
+# natural-language ranking rules, so its order is final: recall skips the recency /
+# temporal / proof-count and strategy boosts that correct a cross-encoder. Its score is a
+# candidate's rank position within one pool rather than a relevance score for the pair —
+# the top candidate is 1.0 on every recall however weak it is — so a fixed floor would
+# only keep a fixed share of the pool and the value is not comparable between recalls
+# (#4901). Recall rejects min_scores.reranker for these and publishes no reranker score.
+#
+# A cross-encoder scores one (query, candidate) pair at a time, so recall corrects it with
+# its own signals and its score is a relevance value a floor can be set against.
+RERANKER_TYPE_CROSS_ENCODER = "cross_encoder"
+RERANKER_TYPE_DECISION_MODEL = "decision_model"
+DECISION_MODEL_PROVIDERS = frozenset({"typesafe"})
+CROSS_ENCODER_PROVIDERS = frozenset(
+    {
+        "local",
+        "tei",
+        "cohere",
+        "openrouter",
+        "flashrank",
+        "litellm",
+        "litellm-sdk",
+        "zeroentropy",
+        "siliconflow",
+        "google",
+        "alibaba",
+        "jina-mlx",
+    }
+)
+# "rrf" serves either type: it is a passthrough that does no ranking, so it is a valid
+# last member of either kind of chain.
+PROVIDERS_BY_RERANKER_TYPE = {
+    RERANKER_TYPE_CROSS_ENCODER: CROSS_ENCODER_PROVIDERS | {"rrf"},
+    RERANKER_TYPE_DECISION_MODEL: DECISION_MODEL_PROVIDERS | {"rrf"},
+}
+DEFAULT_RERANKER_TYPE = RERANKER_TYPE_CROSS_ENCODER
 DEFAULT_RERANKER_PROVIDER = "local"
+# The provider a type falls back to when only the type was set. One env var is then
+# enough to pick a decision model, as it is for a cross-encoder.
+DEFAULT_PROVIDER_BY_RERANKER_TYPE = {
+    RERANKER_TYPE_CROSS_ENCODER: DEFAULT_RERANKER_PROVIDER,
+    RERANKER_TYPE_DECISION_MODEL: "typesafe",
+}
 DEFAULT_RERANKER_SEND_BANK_AS_HEADER = False
 DEFAULT_RERANKER_LOCAL_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_RERANKER_LOCAL_FORCE_CPU = False  # Force CPU mode for local reranker
@@ -2827,6 +2873,41 @@ def _member_float(base: str, suffix: str, default: float) -> float:
         raise ValueError(f"Invalid {base}{suffix}: expected a number, got {raw!r}") from e
 
 
+def reranker_type_of_provider(provider: str) -> str | None:
+    """Which reranker type a provider serves, or None when it serves either or neither."""
+    name = provider.strip().lower()
+    if name in DECISION_MODEL_PROVIDERS:
+        return RERANKER_TYPE_DECISION_MODEL
+    if name in CROSS_ENCODER_PROVIDERS:
+        return RERANKER_TYPE_CROSS_ENCODER
+    return None
+
+
+def _resolve_reranker_type() -> str:
+    """The configured reranker type, inferred from the provider when it is not set.
+
+    Setting only the provider is how this was configured before the type existed, so a
+    provider that belongs to exactly one type still selects it and those deployments keep
+    working untouched.
+    """
+    declared = (os.getenv(ENV_RERANKER_TYPE) or "").strip().lower()
+    if declared:
+        if declared not in PROVIDERS_BY_RERANKER_TYPE:
+            raise ValueError(
+                f"Unknown {ENV_RERANKER_TYPE}: {declared!r}. Supported: {', '.join(sorted(PROVIDERS_BY_RERANKER_TYPE))}"
+            )
+        return declared
+    provider = (os.getenv(ENV_RERANKER_PROVIDER) or "").strip()
+    if not provider:
+        return DEFAULT_RERANKER_TYPE
+    return reranker_type_of_provider(provider) or DEFAULT_RERANKER_TYPE
+
+
+def _default_provider_for_reranker_type() -> str:
+    """The provider to use when the type was set but the provider was not."""
+    return DEFAULT_PROVIDER_BY_RERANKER_TYPE[_resolve_reranker_type()]
+
+
 def _parse_reranker_members() -> list[RerankerMemberConfig]:
     """Parse the indexed reranker fallback members.
 
@@ -3253,6 +3334,9 @@ class HindsightConfig:
     embeddings_vertexai_service_account_key: str | None
 
     # Reranker
+    # Which kind of reranker this server runs: "cross_encoder" or "decision_model".
+    # Server-level only — a recall cannot ask for a different kind than the one configured.
+    reranker_type: str
     reranker_provider: str
     reranker_send_bank_as_header: bool
     reranker_local_model: str
@@ -4619,7 +4703,8 @@ class HindsightConfig:
             embeddings_vertexai_service_account_key=os.getenv(ENV_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY)
             or os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY),
             # Reranker
-            reranker_provider=os.getenv(ENV_RERANKER_PROVIDER, DEFAULT_RERANKER_PROVIDER),
+            reranker_type=_resolve_reranker_type(),
+            reranker_provider=os.getenv(ENV_RERANKER_PROVIDER) or _default_provider_for_reranker_type(),
             reranker_send_bank_as_header=os.getenv(
                 ENV_RERANKER_SEND_BANK_AS_HEADER,
                 str(DEFAULT_RERANKER_SEND_BANK_AS_HEADER),
