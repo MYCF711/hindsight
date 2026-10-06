@@ -351,7 +351,10 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no mental models/observations exist, they're stale, or you need specific details",
-                "- MANDATORY: If search_mental_models and search_observations both return 0 results, you MUST call recall() before giving up",
+                "- MANDATORY: If search_mental_models and search_observations return 0 results, OR return results that "
+                "do not STATE the answer, you MUST call recall() before giving up. Never report that the bank holds "
+                "nothing about something until recall() has run with the question's key terms (an issue key, name or "
+                "identifier) verbatim",
                 "- This is the source of truth that other levels are built from",
                 "",
                 "**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).",
@@ -362,7 +365,9 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no mental model exists, it's stale, or you need specific details",
-                "- MANDATORY: If search_mental_models returns 0 results, you MUST call recall() before giving up",
+                "- MANDATORY: If search_mental_models returns 0 results, OR returns a model that does not STATE the "
+                "answer, you MUST call recall() before giving up. Never report that the bank holds nothing about "
+                "something until recall() has run with the question's key terms verbatim",
                 "- This is the source of truth that mental models are built from",
             ]
         )
@@ -451,19 +456,23 @@ def build_system_prompt_for_tools(
     # it let a reflect answer "the bank holds nothing about X" off the page layer
     # while recall() on the same bank returned the facts (#4567). Freshness and
     # topical overlap are not coverage, so both levels now say to go deeper when
-    # what came back does not answer the question, and to never report an absence
-    # until recall() has run on the question's own key terms.
+    # what came back does not answer the question. The absence rule itself is NOT
+    # repeated here: it lives once in the RAW FACTS level above and once on the
+    # ``done`` tool, because every line here is paid for on every reflect (#4716).
     if budget:
         budget_lower = budget.lower()
         if budget_lower == "low":
             parts.extend(
                 [
                     "## RESEARCH DEPTH: SHALLOW (Quick Response)",
-                    "- Keep the ANSWER short: a quick overview, not exhaustive detail. Depth is what you cut, not coverage",
-                    "- Spend few searches, but make them count: vary the query instead of repeating one that already ran",
-                    "- A mental model or observation that ANSWERS the question is enough to stop; one that is merely on the same topic is not",
-                    "- If what you found does not cover the question, go on to the next level rather than answering from it",
-                    "- MANDATORY: never report that the bank holds nothing (no decision, record, or history) about something until recall() has been called with the question's key terms (an issue key, name, or identifier) verbatim",
+                    "- Keep the ANSWER short: a quick overview, not exhaustive detail. Depth is what you cut, "
+                    "not coverage",
+                    "- Spend few searches, but make them count: vary the query instead of repeating one that "
+                    "already ran",
+                    "- A mental model or observation that ANSWERS the question is enough to stop; one that is "
+                    "merely on the same topic is not",
+                    "- If what you found does not cover the question, go on to the next level rather than "
+                    "answering from it",
                     "",
                 ]
             )
@@ -474,8 +483,8 @@ def build_system_prompt_for_tools(
                     "- Balance thoroughness with efficiency",
                     "- Check multiple sources when the question warrants it",
                     "- Verify stale data if it's central to the answer",
-                    "- A result that is merely on the same topic does not answer the question: when it does not cover it, go on to the next level",
-                    "- MANDATORY: never report that the bank holds nothing (no decision, record, or history) about something until recall() has been called with the question's key terms (an issue key, name, or identifier) verbatim",
+                    "- A result that is merely on the same topic does not answer the question: when it does not "
+                    "cover it, go on to the next level",
                     "- Don't over-explore, but ensure reasonable coverage",
                     "",
                 ]

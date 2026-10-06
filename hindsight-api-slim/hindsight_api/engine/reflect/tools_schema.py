@@ -182,7 +182,19 @@ _DONE_ANSWER_DEFAULT_LANGUAGE = (
     "language directive in the system prompt specifies a different language, follow that directive instead."
 )
 
-_DONE_SUFFICIENCY_GATE = " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only shares the question's topic is not an answer, so search the next level (search_observations, then recall) instead of answering around it. Never call done to report that nothing is known unless recall has already run on the question's key terms."
+#: Appended to both ``done`` descriptions. The stopping condition is what the
+#: model weighs at the moment it picks this tool over another search, and
+#: "gathered enough information" alone left *enough* undefined — so a page that
+#: merely shared the question's topic read as enough, and the reflect loop had
+#: already released the forced lower layers (see agent.py's short-circuit, and
+#: #4567). The retrieval-levels section of the system prompt carries the same
+#: rule once; this is the copy at the decision point.
+_DONE_SUFFICIENCY_GATE = (
+    " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only "
+    "shares the question's topic is not an answer, so search the next level (search_observations, then recall) "
+    "instead of answering around it. Never call done to report that nothing is known unless recall has already "
+    "run on the question's key terms."
+)
 
 TOOL_DONE_ANSWER = {
     "type": "function",
