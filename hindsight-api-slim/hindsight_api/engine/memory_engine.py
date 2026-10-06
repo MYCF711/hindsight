@@ -590,7 +590,7 @@ def validate_sql_schema(sql: str) -> None:
                         )
 
 
-from .cross_encoder import RANK_SCORE_PROVIDERS, CrossEncoderModel
+from .cross_encoder import RANK_SCORE_PROVIDERS, CrossEncoderModel, TypeSafeCrossEncoder
 from .embeddings import Embeddings, create_embeddings_from_env
 from .interface import BankConfigState, BankTemplateImportWrite, MemoryEngineInterface
 
@@ -2997,6 +2997,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Initialize cross-encoder reranker (cached for performance)
         self._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=cross_encoder)
+        self._fast_reflect_decision_model: TypeSafeCrossEncoder | None = None
 
         # Initialize task backend.
         # All backends use BrokerTaskBackend + WorkerPoller for async background execution.
@@ -15064,6 +15065,25 @@ class MemoryEngine(MemoryEngineInterface):
             return self._reflect_llm_config
         return override
 
+    def _reflect_decision_model(self) -> TypeSafeCrossEncoder | None:
+        """The decision model fast reflect asks "is this enough?", or None without a key.
+
+        Built from the TypeSafe reranker settings, whichever reranker recall uses, and
+        once per engine so its connection pool is shared across reflects.
+        """
+        if self._fast_reflect_decision_model is None:
+            config = get_config()
+            if not config.reranker_typesafe_api_key:
+                return None
+            self._fast_reflect_decision_model = TypeSafeCrossEncoder(
+                api_key=config.reranker_typesafe_api_key,
+                model=config.reranker_typesafe_model,
+                base_url=config.reranker_typesafe_base_url,
+                timeout=config.reranker_typesafe_timeout,
+                max_concurrent=config.reranker_typesafe_max_concurrent,
+            )
+        return self._fast_reflect_decision_model
+
     def _llm_for_reflect_operation(self, operation_label: str) -> "LLMConfig | MultiLLMProvider":
         """Pick the LLM for a reflect-pipeline run: interactive, or background refresh.
 
@@ -15225,6 +15245,7 @@ class MemoryEngine(MemoryEngineInterface):
         max_iterations = max(1, int(base_max_iterations * budget_multipliers.get(effective_budget, 1.0)))
         max_context_tokens = config.reflect_max_context_tokens
         wall_timeout = config.reflect_wall_timeout
+        fast_reflect = getattr(resolved_reflect_config, "reflect_mode", None) == "fast"
 
         # Run agentic loop - acquire connections only when needed for DB operations
         # (not held during LLM calls which can be slow)
@@ -15476,6 +15497,12 @@ class MemoryEngine(MemoryEngineInterface):
                         store_document_text=config_dict.get("store_document_text", DEFAULT_STORE_DOCUMENT_TEXT),
                         answer_as_document=answer_as_document,
                         tool_token_limits=tool_token_limits,
+                        fast=fast_reflect,
+                        evidence_is_sufficient_fn=(
+                            decision_model.evidence_is_sufficient
+                            if fast_reflect and (decision_model := self._reflect_decision_model())
+                            else None
+                        ),
                     ),
                     timeout=wall_timeout,
                 )

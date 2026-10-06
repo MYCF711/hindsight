@@ -2359,6 +2359,7 @@ export HINDSIGHT_API_OBSERVATIONS_MISSION="Observations are recurring patterns i
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_REFLECT_MAX_ITERATIONS` | Max tool call iterations before forcing a response | `10` |
+| `HINDSIGHT_API_REFLECT_MODE` | `agent`: one LLM turn per retrieval layer (mental models, observations, facts), each writing its own query, then the LLM decides when to stop. `fast` (experimental): those layers run in parallel with the question as the query, then a decision model judges whether the evidence already answers it. If it does, the answer is the only LLM call. If not, ordinary agent turns take over. The decision model uses the `HINDSIGHT_API_RERANKER_TYPESAFE_*` settings; without a key, fast mode skips the check and goes straight to agent turns. Hierarchical (per bank). | `agent` |
 | `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS` | Max accumulated context tokens in the reflect loop before forcing final synthesis. Prevents `context_length_exceeded` errors on large banks. Lower this if your LLM has a context window smaller than 128K. | `100000` |
 | `HINDSIGHT_API_REFLECT_WALL_TIMEOUT` | Wall-clock timeout in seconds for the entire reflect operation. If exceeded, the request returns HTTP 504. Also bounds a whole mental-model refresh in the worker: one that runs past it is cancelled and marked failed instead of holding its worker slot. | `300` |
 | `HINDSIGHT_API_REFLECT_MISSION` | Global reflect mission (identity and reasoning framing). Overridden per bank via config API. | - |

@@ -976,6 +976,11 @@ _CUT_INSTRUCTIONS = (
     "Count a candidate as relevant only if it helps answer the question."
 )
 
+_SUFFICIENCY_INSTRUCTIONS = (
+    "Does the evidence above answer the question? Judge only what the evidence states, "
+    "not what could be guessed from it."
+)
+
 _OPTION_KEY_OVERHEAD = 7  # JSON envelope overhead per choice option: '"c249": "' + comma/newline
 _LISTING_ITEM_OVERHEAD = 10  # Formatting overhead per item in cut listing: "[1] ...\n\n"
 _MAX_QUERY_TOKENS = 2_000  # Defensive ceiling on query tokens in reranker
@@ -1198,6 +1203,46 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
 
         ranked_finalists = await self._rank_once(query, effective_docs, finalists)
         return ranked_finalists + rest
+
+    # Ordered verdicts for the reflect sufficiency question; only the last one ends
+    # retrieval. "Partly" is its own level so a half-answer keeps searching.
+    SUFFICIENCY_LEVELS = [
+        "The evidence does not answer the question",
+        "The evidence answers part of the question; something it asks is missing",
+        "The evidence fully answers the question",
+    ]
+
+    async def evidence_is_sufficient(self, query: str, evidence: str) -> bool:
+        """Whether ``evidence`` already answers ``query``: one Score question.
+
+        Used by fast reflect to skip the LLM turns that would otherwise decide to keep
+        searching. A Score, not a yes/no Choice, for the reason the cut uses one: the
+        levels are ordered, and "partly" must not be rounded up to "yes".
+        """
+        overhead = (
+            count_tokens(_SUFFICIENCY_INSTRUCTIONS) + sum(count_tokens(level) for level in self.SUFFICIENCY_LEVELS) + 50
+        )
+        prefix = f"Question: {query}\n\nEvidence:\n"
+        budget = max(100, self.MAX_QUESTION_TOKENS - overhead - count_tokens(prefix))
+        if count_tokens(evidence) > budget:
+            # ponytail: keeps the head of the evidence; the agent's own results come
+            # first (pages, then observations, then facts), so the tail is raw facts.
+            evidence = truncate_to_tokens(evidence, budget).text
+        result = await self._ask(
+            {
+                "state": f"{prefix}{evidence}",
+                "model": self.model,
+                "questions": {
+                    "sufficient": {
+                        "type": "score",
+                        "instructions": _SUFFICIENCY_INSTRUCTIONS,
+                        "criteria": self.SUFFICIENCY_LEVELS,
+                    }
+                },
+            }
+        )
+        level = round(float(result["answers"]["sufficient"]["score"]))
+        return level >= len(self.SUFFICIENCY_LEVELS) - 1
 
     async def _cut(self, query: str, docs: list[str], order: list[int]) -> int:
         """How many of the ranked candidates are relevant, as the model sees it."""

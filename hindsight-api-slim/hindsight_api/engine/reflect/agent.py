@@ -20,6 +20,7 @@ from ...config import DEFAULT_RECALL_CHUNKS_MAX_TOKENS, DEFAULT_RECALL_MAX_TOKEN
 from ..llm_interface import LLM_TOOL_CHOICE_AUTO, LLMToolChoice
 from ..llm_trace import LLMQueueWait, reset_queue_wait_sink, set_queue_wait_sink
 from ..llm_transport import describe_llm_error
+from ..response_models import LLMToolCall, LLMToolCallResult
 from .models import (
     DirectiveInfo,
     LengthRewrite,
@@ -143,7 +144,7 @@ def _build_directives_applied(directives: list[dict[str, Any]] | None) -> list[D
 
 if TYPE_CHECKING:
     from ..llm_wrapper import AnyLLMProvider
-    from ..response_models import LLMToolCall, TokenUsage
+    from ..response_models import TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -607,6 +608,8 @@ async def _run_reflect_agent_inner(
     store_document_text: bool = True,
     answer_as_document: bool = False,
     tool_token_limits: ReflectToolTokenLimits | None = None,
+    fast: bool = False,
+    evidence_is_sufficient_fn: Callable[[str, str], Awaitable[bool]] | None = None,
     *,
     reflect_id: str,
     provider_impl: Any,
@@ -642,6 +645,12 @@ async def _run_reflect_agent_inner(
             uncapped-by-default config (``reflect_max_completion_tokens``).
         response_schema: Optional JSON Schema for structured output in final response
         directives: Optional list of directive mental models to inject as hard rules
+        fast: Fast mode. The first retrieval layers run in parallel with the question
+            as their query, instead of one LLM turn each writing a query, and
+            ``evidence_is_sufficient_fn`` (a decision model) may end retrieval there.
+        evidence_is_sufficient_fn: (question, evidence) -> whether the evidence already
+            answers the question. Only consulted in fast mode, once, after the first
+            retrieval; without it fast mode hands over to ordinary ``auto`` turns.
 
     Returns:
         ReflectAgentResult with final answer and metadata
@@ -846,6 +855,7 @@ async def _run_reflect_agent_inner(
             f"iterations={iterations} | "
             f"llm=[{llm_summary}] ({total_llm_ms}ms) | "
             f"tools=[{tools_summary}] ({total_tools_ms}ms) | "
+            f"tokens=in:{total_input_tokens},out:{total_output_tokens} | "
             f"answer='{answer_preview}' | "
             f"total={elapsed_ms}ms"
         )
@@ -1186,6 +1196,27 @@ async def _run_reflect_agent_inner(
         if cancel_check is not None:
             cancel_check()
 
+        # Fast mode, after the parallel first retrieval: a decision model judges whether
+        # that evidence already answers the question. Yes ends retrieval here, so the
+        # only LLM call left is the answer itself; no hands over to ordinary ``auto``
+        # turns, where the LLM writes follow-up queries from what it has read.
+        if fast and iteration == 1 and evidence_is_sufficient_fn is not None:
+            evidence = "\n\n".join(m["content"] for m in messages if m.get("role") == "tool")
+            decision_start = time.time()
+            try:
+                sufficient = await evidence_is_sufficient_fn(query, evidence)
+            except OperationCancelledError:
+                raise
+            except Exception as e:
+                # The decision model only ever saves LLM turns; without its verdict
+                # the agent turns below still answer, so its outage must not fail reflect.
+                logger.warning(f"[REFLECT {reflect_id}] Fast mode: decision model failed, using agent turns: {e}")
+                sufficient = False
+            llm_trace.append({"scope": "fast_sufficiency", "duration_ms": int((time.time() - decision_start) * 1000)})
+            if sufficient:
+                logger.info(f"[REFLECT {reflect_id}] Fast mode: the first retrieval answers the question.")
+                return await _finish(iteration)
+
         # Determine tool_choice for this iteration.
         # Force the full hierarchical retrieval path (only for enabled tools) before allowing auto.
         # Build the forced sequence from the tools that are actually enabled.
@@ -1262,82 +1293,96 @@ async def _run_reflect_agent_inner(
             await _resolve_pending_cache()
 
         call_msg_count = len(messages)
-        # Time spent waiting on LLM concurrency permits is collected separately so a
-        # long `agent_N` entry can be read as "the provider was slow" and nothing
-        # else -- see llm_trace.set_queue_wait_sink (#3881).
-        queue_wait = LLMQueueWait()
-        queue_token = set_queue_wait_sink(queue_wait)
-        try:
-            ct_kwargs: dict[str, Any] = dict(
-                messages=messages,
-                tools=tools,
-                scope="reflect_tool_call",
-                tool_choice=iter_tool_choice,
-                temperature=get_config().llm_temperature_reflect,
-                # Same uncapped-by-default ceiling the synthesis calls use. Left
-                # unset this fell through to the provider's own default, which on
-                # Anthropic truncated long ``done`` payloads before the answer
-                # field was written (#4437).
-                max_completion_tokens=synthesis_max_completion_tokens,
+        if fast and iteration == 0 and forced_sequence:
+            # Fast mode: every forced layer at once, with the question itself as the
+            # query. In agent mode each of these is a full LLM round trip whose only
+            # output is a search string; the theory that later layers need queries
+            # written from earlier results is what this mode puts to the test.
+            result = LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id=f"fast_{tool}", name=tool, arguments={"query": query, "reason": "fast mode"})
+                    for tool in forced_sequence
+                ],
+                finish_reason="tool_calls",
             )
-            if incremental_caching and iter_tool_choice is LLM_TOOL_CHOICE_AUTO and rolling_cache_name is not None:
-                ct_kwargs["cached_prefix"] = rolling_cache_name
-                ct_kwargs["cached_prefix_message_count"] = rolling_cache_boundary
-            result = await llm_config.call_with_tools(**ct_kwargs)
-            llm_duration = int((time.time() - llm_start) * 1000)
-            queued_ms = int(queue_wait.seconds * 1000)
-            consecutive_errors = 0
-            total_input_tokens += result.input_tokens
-            total_output_tokens += result.output_tokens
-            total_cached_tokens += getattr(result, "cached_tokens", 0) or 0
-            total_thoughts_tokens += getattr(result, "thoughts_tokens", 0) or 0
-            llm_trace.append(
-                {
-                    "scope": f"agent_{iteration + 1}",
-                    "duration_ms": llm_duration,
-                    "queued_ms": queued_ms,
-                    "input_tokens": result.input_tokens,
-                    "output_tokens": result.output_tokens,
-                }
-            )
-
-        except OperationCancelledError:
-            # A cancellation is not a provider failure: never retried, never
-            # synthesized around, and it must reach the HTTP layer as itself so a
-            # client disconnect stays a 499 (issue #2122).
-            raise
-        except Exception as e:
-            err_duration = int((time.time() - llm_start) * 1000)
-            queued_ms = int(queue_wait.seconds * 1000)
-            consecutive_errors += 1
-            logger.warning(
-                f"[REFLECT {reflect_id}] LLM error on iteration {iteration + 1}: {describe_llm_error(e)} "
-                f"({err_duration}ms, {queued_ms}ms queued)"
-            )
-            llm_trace.append(
-                {"scope": f"agent_{iteration + 1}_err", "duration_ms": err_duration, "queued_ms": queued_ms}
-            )
-            # Context overflow errors must never be retried — retrying would only make them worse.
-            # Skip straight to final synthesis with whatever evidence we have: the
-            # prompt was too big for the model, which is a budgeting problem, not a
-            # broken dependency, and the evidence gathered so far is intact.
-            if _is_context_overflow_error(e):
-                logger.warning(
-                    f"[REFLECT {reflect_id}] Context window exceeded on iteration {iteration + 1}, "
-                    "forcing final synthesis from gathered evidence."
+            forced_steps_done = len(forced_sequence) - 1  # the increment below completes the sequence
+        else:
+            # Time spent waiting on LLM concurrency permits is collected separately so a
+            # long `agent_N` entry can be read as "the provider was slow" and nothing
+            # else -- see llm_trace.set_queue_wait_sink (#3881).
+            queue_wait = LLMQueueWait()
+            queue_token = set_queue_wait_sink(queue_wait)
+            try:
+                ct_kwargs: dict[str, Any] = dict(
+                    messages=messages,
+                    tools=tools,
+                    scope="reflect_tool_call",
+                    tool_choice=iter_tool_choice,
+                    temperature=get_config().llm_temperature_reflect,
+                    # Same uncapped-by-default ceiling the synthesis calls use. Left
+                    # unset this fell through to the provider's own default, which on
+                    # Anthropic truncated long ``done`` payloads before the answer
+                    # field was written (#4437).
+                    max_completion_tokens=synthesis_max_completion_tokens,
                 )
-                return await _forced_final_synthesis(iteration + 1)
-            # Any other error: retry (capped, so a persistently failing provider does
-            # not hang the run), then give up. Synthesizing an answer here instead
-            # would be built on an evidence set the failed turn never finished
-            # gathering, and callers cannot tell that from a complete one (#2894).
-            # The provider's own retries (429/5xx) already ran inside the call.
-            if iteration < max_iterations - 1 and consecutive_errors < 2:
-                continue
-            raise
+                if incremental_caching and iter_tool_choice is LLM_TOOL_CHOICE_AUTO and rolling_cache_name is not None:
+                    ct_kwargs["cached_prefix"] = rolling_cache_name
+                    ct_kwargs["cached_prefix_message_count"] = rolling_cache_boundary
+                result = await llm_config.call_with_tools(**ct_kwargs)
+                llm_duration = int((time.time() - llm_start) * 1000)
+                queued_ms = int(queue_wait.seconds * 1000)
+                consecutive_errors = 0
+                total_input_tokens += result.input_tokens
+                total_output_tokens += result.output_tokens
+                total_cached_tokens += getattr(result, "cached_tokens", 0) or 0
+                total_thoughts_tokens += getattr(result, "thoughts_tokens", 0) or 0
+                llm_trace.append(
+                    {
+                        "scope": f"agent_{iteration + 1}",
+                        "duration_ms": llm_duration,
+                        "queued_ms": queued_ms,
+                        "input_tokens": result.input_tokens,
+                        "output_tokens": result.output_tokens,
+                    }
+                )
 
-        finally:
-            reset_queue_wait_sink(queue_token)
+            except OperationCancelledError:
+                # A cancellation is not a provider failure: never retried, never
+                # synthesized around, and it must reach the HTTP layer as itself so a
+                # client disconnect stays a 499 (issue #2122).
+                raise
+            except Exception as e:
+                err_duration = int((time.time() - llm_start) * 1000)
+                queued_ms = int(queue_wait.seconds * 1000)
+                consecutive_errors += 1
+                logger.warning(
+                    f"[REFLECT {reflect_id}] LLM error on iteration {iteration + 1}: {describe_llm_error(e)} "
+                    f"({err_duration}ms, {queued_ms}ms queued)"
+                )
+                llm_trace.append(
+                    {"scope": f"agent_{iteration + 1}_err", "duration_ms": err_duration, "queued_ms": queued_ms}
+                )
+                # Context overflow errors must never be retried — retrying would only make them worse.
+                # Skip straight to final synthesis with whatever evidence we have: the
+                # prompt was too big for the model, which is a budgeting problem, not a
+                # broken dependency, and the evidence gathered so far is intact.
+                if _is_context_overflow_error(e):
+                    logger.warning(
+                        f"[REFLECT {reflect_id}] Context window exceeded on iteration {iteration + 1}, "
+                        "forcing final synthesis from gathered evidence."
+                    )
+                    return await _forced_final_synthesis(iteration + 1)
+                # Any other error: retry (capped, so a persistently failing provider does
+                # not hang the run), then give up. Synthesizing an answer here instead
+                # would be built on an evidence set the failed turn never finished
+                # gathering, and callers cannot tell that from a complete one (#2894).
+                # The provider's own retries (429/5xx) already ran inside the call.
+                if iteration < max_iterations - 1 and consecutive_errors < 2:
+                    continue
+                raise
+
+            finally:
+                reset_queue_wait_sink(queue_token)
 
         # No tool calls this turn.
         if not result.tool_calls:
