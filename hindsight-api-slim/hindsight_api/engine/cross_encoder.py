@@ -9,6 +9,7 @@ Configuration via environment variables - see hindsight_api.config for all env v
 import asyncio
 import contextvars
 import logging
+import re
 import time
 import warnings
 from abc import ABC, abstractmethod
@@ -42,6 +43,7 @@ from ..config import (
     DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT,
     DEFAULT_RERANKER_TYPESAFE_MODEL,
     DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
+    DEFAULT_RERANKER_TYPESAFE_RESOLVE_CONFLICTS,
     DEFAULT_RERANKER_TYPESAFE_TIMEOUT,
     DEFAULT_RERANKER_ZEROENTROPY_MODEL,
     DEFAULT_ZEROENTROPY_BASE_URL,
@@ -983,6 +985,58 @@ _CUT_INSTRUCTIONS = (
 _OPTION_KEY_OVERHEAD = 7  # JSON envelope overhead per choice option: '"c249": "' + comma/newline
 _LISTING_ITEM_OVERHEAD = 10  # Formatting overhead per item in cut listing: "[1] ...\n\n"
 _MAX_QUERY_TOKENS = 2_000  # Defensive ceiling on query tokens in reranker
+_CONFLICT_OPTION_TOKENS = 300  # Per-candidate ceiling in a conflict question
+
+# Conflict resolution. A decision model ranks candidates against the question, which is a
+# different thing from noticing that two of them answer it differently. Where one candidate
+# revises another, ranking both highly leaves the caller holding the stale value alongside
+# the current one — and a generator reading them follows the majority, so a corrected fact
+# ranked first but outnumbered by stale restatements does not change the answer.
+#
+# The questions below only ever ask one thing: shown two or more candidates that disagree,
+# which states the CURRENT answer. Judged together, because a candidate read on its own
+# cannot be seen to revise anything.
+
+# Only questions whose answer IS a value can turn on a supersession.
+_VALUE_QUESTION = re.compile(
+    r"\b(when|what date|deadline|how many|how much|how long|which version|"
+    r"what time|how often|total|count|number of)\b",
+    re.I,
+)
+_MONTH_NAMES = ("january february march april may june july august september october november december").split()
+# Pronouns and framing words carry no subject, so they must not count as a shared term.
+_QUESTION_STOPWORDS = frozenset(
+    "what when which who how many much long does did your their that this with from have "
+    "been will would about there here they them".split()
+)
+
+
+def _normalised_tokens(text: str) -> set[str]:
+    return set(re.sub(r"[^a-z0-9 ]", "", text.lower()).split())
+
+
+def _token_overlap(a: set[str], b: set[str]) -> float:
+    """Shared tokens over the SHORTER candidate, so a terse revision still matches."""
+    return len(a & b) / max(1, min(len(a), len(b))) if a and b else 0.0
+
+
+def _value_payload(text: str) -> tuple[frozenset[int], frozenset[str]]:
+    """The numbers and months a value question turns on.
+
+    Years are dropped, so "April 1, 2024" and "2024-04-01" compare on day and month
+    rather than agreeing because they share 2024.
+    """
+    low = text.lower()
+    numbers = {int(n) for n in re.findall(r"\b(\d{1,4})\b", low) if int(n) < 1900}
+    months = {m for m in _MONTH_NAMES if m in low}
+    return frozenset(numbers), frozenset(months)
+
+
+def _subject_terms(query: str) -> set[str]:
+    """The query's own content words: a conflict counts only if both candidates are
+    about what was ASKED, not merely about each other. Most candidates carry some
+    incidental number, and without this the trigger fires almost everywhere."""
+    return {w for w in re.findall(r"[a-z0-9']+", query.lower()) if len(w) > 3 and w not in _QUESTION_STOPWORDS}
 
 
 def _rank_instructions(query: str) -> str:
@@ -1000,7 +1054,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     TypeSafe reranker (https://typesafe.ai), Jev by default.
 
     Not a Cohere-compatible /rerank endpoint: TypeSafe evaluates typed *questions*
-    against a *state*. This provider asks two of them.
+    against a *state*. This provider asks up to three of them.
 
     **Rank — one Choice whose options are the candidates.** A Choice answers with a
     probability for every option, summing to 1. When the candidate pool fits within
@@ -1025,13 +1079,24 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     pools are not comparable. Candidates below the cut score exactly 0.0, which is
     how :attr:`prunes_candidates` tells the caller to leave them out.
 
-    The ``confidence`` both answers carry is deliberately ignored: at this question shape
+    **Conflict resolution — one Choice per disagreeing cluster**, asking which states the
+    current answer. Only asked when ``resolve_conflicts`` is on, and only on questions whose
+    answer is itself a value, among candidates that overlap heavily, differ on a number or
+    date, and share the question's own subject terms. Ranking cannot do this: a candidate
+    judged on its own cannot be seen to revise another, and judged against the question both
+    the stale and the corrected value look equally on-topic. Losers are dropped rather than
+    moved down, because a generator reading one correction among several stale restatements
+    follows the majority.
+
+    The ``confidence`` the rank and cut answers carry is deliberately ignored: at this question shape
     it does not say how much to trust the answer. Over 40 recalls of 64-118 candidates it
     ran 0.10-0.95 on the rank question and 0.00-0.99 on the cut, averaging about 0.5 on
     both, while asking the identical cut three times returned the identical depth on 37
     of the 40 — and two of the three that moved carried an above-average confidence. So a
     gate on it would withhold pruning on about half of all recalls while telling us
-    nothing about which verdicts are wrong.
+    nothing about which verdicts are wrong. The conflict question is the exception and does
+    gate on it: with two to five options rather than a whole pool, confidence is not diluted
+    by the option count, and wrong picks there came back at 0.40-0.60 against about 0.80.
     """
 
     SYSTEMONE_PATH = "/v1/systemone"
@@ -1068,6 +1133,30 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     ]
     CUT_DEPTHS = [1, 2, 3, 5, 10, None]  # None keeps the whole shortlist
 
+    # Textual overlap above which two candidates are restatements of each other — unless
+    # their value payload differs, in which case they are never duplicates however much
+    # text they share. Normalising by the shorter candidate once deleted a 16-token
+    # correction that shared 14 tokens with the claim it corrects: at 0.875 overlap it
+    # looked like a duplicate, and the one token they differed on was the answer.
+    DUPLICATE_OVERLAP = 0.85
+
+    # Overlap at which two candidates are "the same thing with a different value". There is
+    # deliberately no upper bound: the pairs that most need resolving are the ones that
+    # overlap almost completely and differ on one value.
+    CONFLICT_OVERLAP = 0.6
+    # Conflicts are looked for around the top-ranked candidates only.
+    CONFLICT_ANCHORS = 25
+    # Both candidates must share this many of the question's own subject terms. Without it
+    # the trigger fired on 94 of 100 questions and deleted 7.5 candidates on average —
+    # indiscriminate pruning rather than conflict resolution.
+    CONFLICT_MIN_SUBJECT_TERMS = 2
+    # Clusters larger than this are a topic, not a disagreement.
+    CONFLICT_MAX_CLUSTER = 10
+    # Below this, the model is not resolving a conflict: wrong picks came back at 0.40-0.60
+    # against about 0.80 for right ones, on a two-to-five option question where confidence
+    # is not diluted by the option count the way the pool-wide rank question's is.
+    CONFLICT_MIN_CONFIDENCE = 0.7
+
     def __init__(
         self,
         api_key: str,
@@ -1076,13 +1165,18 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         timeout: float = DEFAULT_RERANKER_TYPESAFE_TIMEOUT,
         max_concurrent: int = DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT,
         prune_candidates: bool = DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
+        resolve_conflicts: bool = DEFAULT_RERANKER_TYPESAFE_RESOLVE_CONFLICTS,
     ):
         # Tolerate an unset-but-present value ("VAR=" in a compose file, or a config
         # built with every field zeroed) by falling back to the default.
         self.model = model or DEFAULT_RERANKER_TYPESAFE_MODEL
         self.base_url = (base_url or DEFAULT_RERANKER_TYPESAFE_BASE_URL).rstrip("/")
         self.timeout = timeout
-        self.prunes_candidates = bool(prune_candidates)
+        self._prunes_by_cut = bool(prune_candidates)
+        self._resolves_conflicts = bool(resolve_conflicts)
+        # Either kind of dropping gives a candidate 0.0, and this is what tells the caller
+        # that a 0.0 means "leave it out" rather than "ranked last".
+        self.prunes_candidates = self._prunes_by_cut or self._resolves_conflicts
         # CrossLoopSemaphore, not asyncio.Semaphore: one encoder instance is built at
         # startup and reached from every loop in the process (worker threads run their
         # own via asyncio.run), and an asyncio.Semaphore binds to whichever loop first
@@ -1103,7 +1197,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     async def initialize(self) -> None:
         logger.info(
             f"Reranker: initializing TypeSafe provider at {self.base_url} with model {self.model} "
-            f"(prune_candidates={self.prunes_candidates})"
+            f"(prune_candidates={self._prunes_by_cut}, resolve_conflicts={self._resolves_conflicts})"
         )
 
     async def _ask(self, body: dict) -> dict:
@@ -1280,6 +1374,123 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         depth = self.CUT_DEPTHS[min(len(self.CUT_DEPTHS) - 1, max(0, level))]
         return len(shortlist) if depth is None else min(depth, len(shortlist))
 
+    _CONFLICT_INSTRUCTIONS = (
+        "These memories give different answers to the question. Which states the CURRENT "
+        "answer? When they conflict, the most recently stated value supersedes the earlier one."
+    )
+
+    def _duplicates(self, docs: list[str], order: list[int]) -> set[int]:
+        """Restatements of a higher-ranked candidate — never one that disagrees on a value."""
+        dropped: set[int] = set()
+        kept: list[tuple[set[str], tuple[frozenset[int], frozenset[str]]]] = []
+        for index in order:
+            tokens = _normalised_tokens(docs[index])
+            payload = _value_payload(docs[index])
+            for previous_tokens, previous_payload in kept:
+                if _token_overlap(tokens, previous_tokens) <= self.DUPLICATE_OVERLAP:
+                    continue
+                # Textually near-identical. A duplicate only if they also AGREE on the values.
+                if payload != previous_payload:
+                    continue
+                dropped.add(index)
+                break
+            else:
+                kept.append((tokens, payload))
+        return dropped
+
+    def _conflict_clusters(self, query: str, docs: list[str], order: list[int]) -> list[list[int]]:
+        """Candidates that overlap heavily but disagree on a value, grouped around each anchor.
+
+        Each cluster is one anchor plus its DIRECT peers, and nothing else. Grouping
+        transitively does not work here: single-linkage at a 0.35 overlap floor collapsed a
+        whole 80-candidate pool into one component, and no threshold separates cleanly — at
+        0.60 the conflicting pair groups but drags 66 candidates in with it, at 0.70 and
+        above the chaining stops but the pair itself splits apart. Anchoring on each
+        top-ranked candidate avoids chaining entirely.
+        """
+        if not _VALUE_QUESTION.search(query):
+            return []
+        tokens = {index: _normalised_tokens(docs[index]) for index in order}
+        payloads = {index: _value_payload(docs[index]) for index in order}
+        subject = _subject_terms(query)
+
+        def about_the_question(index: int) -> bool:
+            return not subject or len(tokens[index] & subject) >= self.CONFLICT_MIN_SUBJECT_TERMS
+
+        clusters: list[list[int]] = []
+        seen: set[tuple[int, ...]] = set()
+        for anchor in order[: self.CONFLICT_ANCHORS]:
+            if not about_the_question(anchor):
+                continue
+            peers = [
+                index
+                for index in order
+                if index != anchor
+                and payloads[index] != payloads[anchor]
+                and _token_overlap(tokens[anchor], tokens[index]) >= self.CONFLICT_OVERLAP
+                and about_the_question(index)
+            ]
+            if not peers:
+                continue
+            cluster = tuple(sorted([anchor, *peers]))
+            if 2 <= len(cluster) <= self.CONFLICT_MAX_CLUSTER and cluster not in seen:
+                seen.add(cluster)
+                clusters.append(list(cluster))
+        return clusters
+
+    async def _superseded(self, query: str, docs: list[str], order: list[int]) -> set[int]:
+        """The candidates a confidently-resolved conflict says are out of date.
+
+        One Choice per cluster, all in a single request. Losers are dropped rather than
+        moved down the order: with the current value ranked first but several stale
+        restatements still present, a generator reads the majority and keeps answering
+        with the superseded value, so reordering alone changes nothing.
+        """
+        clusters = self._conflict_clusters(query, docs, order)
+        if not clusters:
+            return set()
+
+        questions: dict[str, dict] = {}
+        by_key: dict[str, list[int]] = {}
+        for number, cluster in enumerate(clusters):
+            key = f"conflict{number}"
+            by_key[key] = cluster
+            questions[key] = {
+                "type": "choice",
+                # Strict wording only. Adding "when they are merely different details, pick
+                # the one that answers the question most directly" inverted the verdict on the
+                # measured pair: it chose the stale candidate, which echoes the question's own
+                # wording, at confidence 0.40-0.60 against 0.78-0.80 for the strict form.
+                "instructions": self._CONFLICT_INSTRUCTIONS,
+                "criteria": {
+                    f"c{slot}": truncate_to_tokens(docs[index], _CONFLICT_OPTION_TOKENS).text
+                    for slot, index in enumerate(cluster)
+                },
+            }
+
+        try:
+            answers = (await self._ask({"state": f"Question: {query}", "model": self.model, "questions": questions}))[
+                "answers"
+            ]
+        except Exception as e:
+            # A conflict left unresolved returns a stale candidate alongside the current
+            # one, which is what recall did before. Failing the whole rerank would be worse.
+            logger.warning(f"Reranker: TypeSafe conflict resolution failed, keeping every candidate: {e}")
+            return set()
+
+        superseded: set[int] = set()
+        for key, cluster in by_key.items():
+            answer = answers.get(key) or {}
+            choice = answer.get("choice")
+            if not choice or float(answer.get("confidence") or 0.0) < self.CONFLICT_MIN_CONFIDENCE:
+                continue
+            try:
+                winner = cluster[int(str(choice)[1:])]
+            except (ValueError, IndexError):
+                continue
+            superseded.update(index for index in cluster if index != winner)
+        return superseded
+
     async def _rank_group(self, query: str, docs: list[str], indices: list[int], scores: list[float]) -> None:
         if not indices:
             return
@@ -1293,7 +1504,19 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             query = truncate_to_tokens(query, effective_query_cap).text
 
         order = await self._rank(query, docs, indices)
-        keep = await self._cut(query, docs, order) if self.prunes_candidates else len(order)
+        if self._resolves_conflicts:
+            # Restatements go first: a cluster of five ways of saying the stale value is one
+            # conflict, and resolving it five times spends five questions on one answer.
+            dropped = self._duplicates(docs, order)
+            remaining = [index for index in order if index not in dropped]
+            dropped |= await self._superseded(query, docs, remaining)
+            kept = [index for index in order if index not in dropped]
+            # Never return nothing. One candidate the caller can dismiss beats silence,
+            # same reasoning as the cut's missing "nothing is relevant" level.
+            order = kept or order[:1]
+            # Anything dropped keeps the 0.0 it started with, which prunes_candidates
+            # tells the caller to leave out.
+        keep = await self._cut(query, docs, order) if self._prunes_by_cut else len(order)
         # Positions, not confidences — see the class docstring. Descending from 1.0 so
         # the caller's ordering is preserved, and 0.0 for everything past the cut,
         # which is how prunes_candidates marks a candidate to leave out.
@@ -2423,6 +2646,7 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             timeout=member.typesafe_timeout,
             max_concurrent=member.typesafe_max_concurrent,
             prune_candidates=member.typesafe_prune_candidates,
+            resolve_conflicts=member.typesafe_resolve_conflicts,
         )
     elif provider == "rrf":
         return RRFPassthroughCrossEncoder()

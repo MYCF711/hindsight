@@ -319,6 +319,130 @@ class TestFactory:
         assert session.urls == ["https://proxy.example.com/v1/systemone"]
 
 
+class TestConflictResolution:
+    """Which of two candidates that disagree states the current answer.
+
+    The pair here is the shape the behaviour was built on: a corrected deadline and the
+    stale claim it corrects, overlapping on almost every token and differing on one number.
+    Ranking cannot separate them — only asking about them together can.
+    """
+
+    STALE = "The first sprint has a deadline of April 1, 2024 for completing the basic layout and navigation"
+    CURRENT = "The first sprint has a deadline of April 5, 2024 for completing the basic layout and navigation"
+    OTHER = "The team chose Postgres for storage"
+    QUERY = "What is the deadline for completing the first sprint?"
+
+    def _encoder(self, choice=None, confidence=0.9, resolve=True):
+        """An encoder whose conflict question answers `choice`, with the asks recorded."""
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=resolve)
+        session = _FakeSession({}, cut_level=5.0)
+        session.conflicts: list[dict] = []
+        plain_post = session._post
+
+        @asynccontextmanager
+        async def post(url, headers=None, json=None):
+            question = next(iter(json["questions"].values()))
+            if question["instructions"] == encoder._CONFLICT_INSTRUCTIONS:
+                session.conflicts.append(json)
+                answers = {
+                    key: {"type": "choice", "choice": choice, "confidence": confidence} for key in json["questions"]
+                }
+                yield _FakeResponse({"answers": answers})
+            else:
+                async with plain_post(url, headers=headers, json=json) as response:
+                    yield response
+
+        session.post = lambda url, headers=None, json=None: post(url, headers=headers, json=json)
+        encoder._session = session
+        return encoder, session
+
+    @property
+    def _pairs(self):
+        return [(self.QUERY, self.STALE), (self.QUERY, self.CURRENT), (self.QUERY, self.OTHER)]
+
+    @pytest.mark.asyncio
+    async def test_the_superseded_candidate_is_dropped_not_demoted(self):
+        """Reordering is not enough: a generator reading several stale restatements and one
+        correction follows the majority, so the stale ones have to leave."""
+        encoder, _ = self._encoder(choice="c1")
+        scores = await encoder._predict(self._pairs)
+        assert scores[0] == 0.0, "the superseded candidate must be pruned, not ranked lower"
+        assert scores[1] > 0.0
+        assert encoder.prunes_candidates is True
+
+    @pytest.mark.asyncio
+    async def test_a_hedged_verdict_drops_nothing(self):
+        """Below the floor the model is not resolving a conflict, and a wrong drop deletes
+        the answer. Keeping both leaves recall where it already was."""
+        encoder, _ = self._encoder(choice="c1", confidence=0.5)
+        scores = await encoder._predict(self._pairs)
+        assert all(score > 0.0 for score in scores)
+
+    @pytest.mark.asyncio
+    async def test_a_question_that_does_not_ask_for_a_value_is_left_alone(self):
+        """A supersession can only matter when the answer IS a value."""
+        encoder, session = self._encoder(choice="c1")
+        query = "Who owns the first sprint?"
+        await encoder._predict([(query, self.STALE), (query, self.CURRENT)])
+        assert session.conflicts == []
+
+    @pytest.mark.asyncio
+    async def test_candidates_that_are_not_about_the_question_are_left_alone(self):
+        """Most candidates carry some incidental number; sharing one is not a conflict."""
+        encoder, session = self._encoder(choice="c0")
+        await encoder._predict(
+            [
+                (self.QUERY, "Version 1 of the logo was approved by the design team"),
+                (self.QUERY, "Version 2 of the logo was approved by the design team"),
+            ]
+        )
+        assert session.conflicts == []
+
+    @pytest.mark.asyncio
+    async def test_resolution_is_off_unless_asked_for(self):
+        encoder, session = self._encoder(choice="c1", resolve=False)
+        scores = await encoder._predict(self._pairs)
+        assert session.conflicts == []
+        assert all(score > 0.0 for score in scores)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_conflict_call_keeps_every_candidate(self):
+        """Recall returning a stale candidate beside the current one is where it was
+        before; failing the whole rerank over it would be worse."""
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
+        session = _FakeSession({}, cut_level=5.0)
+        plain_post = session._post
+
+        @asynccontextmanager
+        async def post(url, headers=None, json=None):
+            if next(iter(json["questions"].values()))["instructions"] == encoder._CONFLICT_INSTRUCTIONS:
+                raise RuntimeError("upstream down")
+            async with plain_post(url, headers=headers, json=json) as response:
+                yield response
+
+        session.post = lambda url, headers=None, json=None: post(url, headers=headers, json=json)
+        encoder._session = session
+        scores = await encoder._predict(self._pairs)
+        assert all(score > 0.0 for score in scores)
+
+    def test_a_terse_correction_is_not_a_duplicate_of_what_it_corrects(self):
+        """Normalising overlap by the shorter candidate put this pair at 0.875, and the one
+        token they differ on is the answer."""
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
+        assert encoder._duplicates([self.STALE, self.CURRENT], [0, 1]) == set()
+
+    def test_a_restatement_that_agrees_on_the_values_is_a_duplicate(self):
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
+        assert encoder._duplicates([self.STALE, self.STALE + ", as agreed"], [0, 1]) == {1}
+
+    def test_a_cluster_is_the_anchor_and_its_direct_peers_only(self):
+        """Grouping transitively collapsed a whole pool into one component; anchoring on
+        each top-ranked candidate is what stops the chaining."""
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
+        docs = [self.STALE, self.CURRENT, self.OTHER]
+        assert encoder._conflict_clusters(self.QUERY, docs, [0, 1, 2]) == [[0, 1]]
+
+
 class TestRerankerType:
     """The reranker type is what an operator picks; the provider says who serves it."""
 

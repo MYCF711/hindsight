@@ -652,6 +652,7 @@ ENV_RERANKER_TYPESAFE_BASE_URL = "HINDSIGHT_API_RERANKER_TYPESAFE_BASE_URL"
 ENV_RERANKER_TYPESAFE_TIMEOUT = "HINDSIGHT_API_RERANKER_TYPESAFE_TIMEOUT"
 ENV_RERANKER_TYPESAFE_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_TYPESAFE_MAX_CONCURRENT"
 ENV_RERANKER_TYPESAFE_PRUNE_CANDIDATES = "HINDSIGHT_API_RERANKER_TYPESAFE_PRUNE_CANDIDATES"
+ENV_RERANKER_TYPESAFE_RESOLVE_CONFLICTS = "HINDSIGHT_API_RERANKER_TYPESAFE_RESOLVE_CONFLICTS"
 
 # Alibaba Cloud DashScope configuration (reranker only)
 ENV_RERANKER_ALIBABA_API_KEY = "HINDSIGHT_API_RERANKER_ALIBABA_API_KEY"
@@ -1489,6 +1490,10 @@ DEFAULT_RERANKER_TYPESAFE_BASE_URL = "https://api.typesafe.ai"
 DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT = 24
 # Off by default: dropping changes what recall returns, so it is opt-in.
 DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES = False
+# Resolve conflicts among the ranked candidates: drop restatements, then ask which of a
+# disagreeing set states the current answer and drop the superseded ones. Off by default
+# because it shrinks what recall returns, same as PRUNE_CANDIDATES.
+DEFAULT_RERANKER_TYPESAFE_RESOLVE_CONFLICTS = False
 
 DEFAULT_RERANKER_ALIBABA_MODEL = "qwen3-rerank"
 
@@ -2798,6 +2803,7 @@ class RerankerMemberConfig:
     typesafe_timeout: float
     typesafe_max_concurrent: int
     typesafe_prune_candidates: bool
+    typesafe_resolve_conflicts: bool
     # alibaba
     alibaba_api_key: str | None
     alibaba_model: str
@@ -2987,6 +2993,9 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                 ),
                 typesafe_prune_candidates=_member_bool(
                     base, "TYPESAFE_PRUNE_CANDIDATES", DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES
+                ),
+                typesafe_resolve_conflicts=_member_bool(
+                    base, "TYPESAFE_RESOLVE_CONFLICTS", DEFAULT_RERANKER_TYPESAFE_RESOLVE_CONFLICTS
                 ),
                 alibaba_api_key=_member_opt_str(base, "ALIBABA_API_KEY"),
                 alibaba_model=_member_str(base, "ALIBABA_MODEL", DEFAULT_RERANKER_ALIBABA_MODEL),
@@ -3399,6 +3408,7 @@ class HindsightConfig:
     reranker_typesafe_timeout: float
     reranker_typesafe_max_concurrent: int
     reranker_typesafe_prune_candidates: bool
+    reranker_typesafe_resolve_conflicts: bool
     reranker_alibaba_api_key: str | None
     reranker_alibaba_model: str
     reranker_alibaba_timeout: float
@@ -4007,6 +4017,7 @@ class HindsightConfig:
             typesafe_timeout=self.reranker_typesafe_timeout,
             typesafe_max_concurrent=self.reranker_typesafe_max_concurrent,
             typesafe_prune_candidates=self.reranker_typesafe_prune_candidates,
+            typesafe_resolve_conflicts=self.reranker_typesafe_resolve_conflicts,
             alibaba_api_key=self.reranker_alibaba_api_key,
             alibaba_model=self.reranker_alibaba_model,
             alibaba_timeout=self.reranker_alibaba_timeout,
@@ -4845,6 +4856,9 @@ class HindsightConfig:
             ),
             reranker_typesafe_prune_candidates=_parse_boolean_env(
                 ENV_RERANKER_TYPESAFE_PRUNE_CANDIDATES, DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES
+            ),
+            reranker_typesafe_resolve_conflicts=_parse_boolean_env(
+                ENV_RERANKER_TYPESAFE_RESOLVE_CONFLICTS, DEFAULT_RERANKER_TYPESAFE_RESOLVE_CONFLICTS
             ),
             # Alibaba Cloud DashScope reranker
             reranker_alibaba_api_key=os.getenv(ENV_RERANKER_ALIBABA_API_KEY),

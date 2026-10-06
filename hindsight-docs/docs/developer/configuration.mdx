@@ -1231,6 +1231,7 @@ ZeroEntropy's `zembed-1` supports Matryoshka dimensions: `2560`, `1280`, `640`, 
 | `HINDSIGHT_API_RERANKER_TYPESAFE_TIMEOUT` | HTTP request timeout for the TypeSafe reranker (seconds). | `60.0` |
 | `HINDSIGHT_API_RERANKER_TYPESAFE_MAX_CONCURRENT` | Maximum in-flight TypeSafe requests. | `24` |
 | `HINDSIGHT_API_RERANKER_INSTRUCTIONS` | Ranking rules in plain words, followed by decision-model rerankers (`typesafe`) instead of the recency/temporal boosts. Hierarchical: overridable per bank as `reranker_instructions`. See the TypeSafe note below. | Prefer newer facts on conflict; prefer facts dated near the time asked about |
+| `HINDSIGHT_API_RERANKER_TYPESAFE_RESOLVE_CONFLICTS` | Drop restatements, then ask which of a disagreeing set of candidates states the current answer and drop the superseded ones. Only fires on questions whose answer is a value. Shrinks what recall returns — see the note below. | `false` |
 | `HINDSIGHT_API_RERANKER_TYPESAFE_PRUNE_CANDIDATES` | Ask a second question that cuts the ranked list where relevance ends, returning only the relevant candidates. Shrinks what recall returns — see the note below. | `false` |
 | `HINDSIGHT_API_RERANKER_ALIBABA_API_KEY` | Alibaba Cloud DashScope API key for reranking | - |
 | `HINDSIGHT_API_RERANKER_ALIBABA_MODEL` | DashScope rerank model | `qwen3-rerank` |
@@ -1490,6 +1491,16 @@ The default restates what the boosts did:
 - When candidates conflict, prefer the one with the more recent date.
 - When the question is about a specific time, prefer candidates dated near that time.
 ```
+
+**Conflicts.** Ranking a pool against a question cannot tell that one candidate revises
+another: judged against the question, a stale value and the value that corrects it look
+equally on-topic, and returning both leaves the caller — or a generator reading them — to
+pick. With `HINDSIGHT_API_RERANKER_TYPESAFE_RESOLVE_CONFLICTS=true`, candidates that
+overlap heavily, differ on a number or date, and share the question's own subject terms are
+put to one further question: which states the current answer. The superseded ones are
+dropped rather than ranked lower, because one correction among several stale restatements
+loses to the majority. It only fires on questions whose answer is itself a value (a date, a
+count, a quantity), and a hedged verdict drops nothing.
 
 Recall appends today's date (or the recall's `question_date`) so relative times resolve.
 Each candidate carries its event date. A rule that depends on something the candidate
