@@ -43,10 +43,14 @@ from ..config import (
     DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT,
     DEFAULT_RERANKER_TYPESAFE_MODEL,
     DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
+    DEFAULT_RERANKER_TYPESAFE_RANK_MODE,
     DEFAULT_RERANKER_TYPESAFE_RESOLVE_CONFLICTS,
     DEFAULT_RERANKER_TYPESAFE_TIMEOUT,
     DEFAULT_RERANKER_ZEROENTROPY_MODEL,
     DEFAULT_ZEROENTROPY_BASE_URL,
+    ENV_RERANKER_TYPESAFE_RANK_MODE,
+    RANK_MODE_LISTWISE,
+    RANK_MODE_POINTWISE,
     RerankerMemberConfig,
 )
 from .aiohttp_session import LoopLocal, LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
@@ -87,6 +91,16 @@ DECISION_PROVIDERS = DECISION_MODEL_PROVIDERS
 # providers. Set by CrossEncoderReranker.rerank(); cross-encoders ignore it.
 rerank_instructions: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "hindsight_rerank_instructions", default=None
+)
+
+# The context every candidate in this rerank shares — the bank's own framing, which recall
+# would otherwise paste onto each one. A decision provider puts it in the question state
+# once instead: repeated per candidate it cannot say which candidate beats which, it makes
+# any overlap comparison between two of them read as near-identical, and it spends the
+# window on the same text once per candidate. Set by CrossEncoderReranker.rerank();
+# cross-encoders never see it and keep their per-candidate prefix.
+rerank_shared_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "hindsight_rerank_shared_context", default=None
 )
 
 
@@ -986,6 +1000,17 @@ _OPTION_KEY_OVERHEAD = 7  # JSON envelope overhead per choice option: '"c249": "
 _LISTING_ITEM_OVERHEAD = 10  # Formatting overhead per item in cut listing: "[1] ...\n\n"
 _MAX_QUERY_TOKENS = 2_000  # Defensive ceiling on query tokens in reranker
 _CONFLICT_OPTION_TOKENS = 300  # Per-candidate ceiling in a conflict question
+# Recall prepends this per candidate, so it is held aside while the pool's shared
+# preamble is found and put back afterwards.
+_DATE_PREFIX = re.compile(r"^\[Date: [^\]]*\]\s*")
+_KEEP_QUESTION_OVERHEAD = 40  # JSON framing per pointwise question
+_REQUEST_OVERHEAD_TOKENS = 200  # State and envelope around a batch of them
+
+# The pointwise rank question. Four wordings were tried on the same pool; this one is the
+# best calibrated, lifting the wanted candidate to 0.74 against 0.59 for "contains
+# information needed to answer" while holding the pool median at 0.08. Framing it as
+# help-versus-distract asks the question a keep/drop decision actually turns on.
+_KEEP_INSTRUCTIONS = "Showing this memory to someone answering the question would help them, rather than distract them."
 
 # Conflict resolution. A decision model ranks candidates against the question, which is a
 # different thing from noticing that two of them answer it differently. Where one candidate
@@ -1011,8 +1036,19 @@ _QUESTION_STOPWORDS = frozenset(
 )
 
 
+def _comparable(text: str) -> str:
+    """A candidate stripped of the metadata recall prefixes, for comparing it to another.
+
+    The date is not content: two candidates are not restatements of each other because they
+    happened on the same day, and the date's own digits must not reach a value payload or
+    "2024" counts as the number the question turns on. It stays on the text the model is
+    asked to rank, where it is what lets a ranking rule prefer the more recent candidate.
+    """
+    return _DATE_PREFIX.sub("", text)
+
+
 def _normalised_tokens(text: str) -> set[str]:
-    return set(re.sub(r"[^a-z0-9 ]", "", text.lower()).split())
+    return set(re.sub(r"[^a-z0-9 ]", "", _comparable(text).lower()).split())
 
 
 def _token_overlap(a: set[str], b: set[str]) -> float:
@@ -1026,10 +1062,48 @@ def _value_payload(text: str) -> tuple[frozenset[int], frozenset[str]]:
     Years are dropped, so "April 1, 2024" and "2024-04-01" compare on day and month
     rather than agreeing because they share 2024.
     """
-    low = text.lower()
+    low = _comparable(text).lower()
     numbers = {int(n) for n in re.findall(r"\b(\d{1,4})\b", low) if int(n) < 1900}
     months = {m for m in _MONTH_NAMES if m in low}
     return frozenset(numbers), frozenset(months)
+
+
+def _strip_shared_prefix(docs: list[str], indices: list[int]) -> dict[int, str]:
+    """Each candidate's own text, with any preamble every candidate shares removed.
+
+    Recall prefixes a candidate with its bank context, which for a single-conversation
+    bank is the same block of profile text on every one of them. Text identical across
+    the whole pool cannot discriminate between its members, and leaving it in breaks the
+    comparisons here: candidates sharing 60 tokens of boilerplate clear any overlap
+    threshold, so dedupe reads them as restatements of each other, and a value payload
+    picks up numbers out of the preamble rather than the fact. It also costs the window
+    the same boilerplate once per candidate, which on a 300-candidate pool is most of it.
+
+    Only whole lines are stripped, so a prefix is never cut mid-sentence, and only when
+    every candidate in the pool agrees on them. The date recall prepends is taken off
+    first and put back after: it is per-candidate, so leaving it in front would mean the
+    pool shares no prefix at all and nothing would be stripped — which is exactly what
+    happened before this handled it.
+    """
+    if len(indices) < 2:
+        return {index: docs[index] for index in indices}
+    marked = [_DATE_PREFIX.match(docs[index]) for index in indices]
+    dates = [match.group(0) if match else "" for match in marked]
+    bodies = [docs[index][len(date) :] for index, date in zip(indices, dates)]
+
+    split = [body.split("\n") for body in bodies]
+    shared = 0
+    for lines in zip(*split):
+        if len(set(lines)) > 1:
+            break
+        shared += 1
+    if not shared:
+        return {index: docs[index] for index in indices}
+    stripped = {}
+    for index, date, lines in zip(indices, dates, split):
+        own = "\n".join(lines[shared:]).strip()
+        stripped[index] = f"{date}{own}" if own else docs[index]
+    return stripped
 
 
 def _subject_terms(query: str) -> set[str]:
@@ -1111,6 +1185,13 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     # keeps a handful, so a longer list costs tokens to no purpose.
     SHORTLIST = 12
 
+    # Ceiling on ONE request carrying many small questions, which is a different limit from
+    # the single-question one below. Measured: about 65.4k input tokens and roughly 750
+    # single-candidate questions go through, and 775 come back max_tokens_exceeded, so both
+    # are kept clear of the edge.
+    MAX_REQUEST_TOKENS = 60_000
+    MAX_QUESTIONS = 700
+
     # Context window safety limit for Jev /v1/systemone.
     # Single question context limit is 32k. A defensive safety margin (26k vs 32k)
     # absorbs cross-tokenizer divergence and JSON envelope formatting overheads.
@@ -1166,6 +1247,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         max_concurrent: int = DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT,
         prune_candidates: bool = DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
         resolve_conflicts: bool = DEFAULT_RERANKER_TYPESAFE_RESOLVE_CONFLICTS,
+        rank_mode: str = DEFAULT_RERANKER_TYPESAFE_RANK_MODE,
     ):
         # Tolerate an unset-but-present value ("VAR=" in a compose file, or a config
         # built with every field zeroed) by falling back to the default.
@@ -1174,6 +1256,12 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         self.timeout = timeout
         self._prunes_by_cut = bool(prune_candidates)
         self._resolves_conflicts = bool(resolve_conflicts)
+        self.rank_mode = (rank_mode or DEFAULT_RERANKER_TYPESAFE_RANK_MODE).strip().lower()
+        if self.rank_mode not in (RANK_MODE_LISTWISE, RANK_MODE_POINTWISE):
+            raise ValueError(
+                f"{ENV_RERANKER_TYPESAFE_RANK_MODE} must be "
+                f"'{RANK_MODE_LISTWISE}' or '{RANK_MODE_POINTWISE}', not {rank_mode!r}"
+            )
         # Either kind of dropping gives a candidate 0.0, and this is what tells the caller
         # that a 0.0 means "leave it out" rather than "ranked last".
         self.prunes_candidates = self._prunes_by_cut or self._resolves_conflicts
@@ -1197,7 +1285,8 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     async def initialize(self) -> None:
         logger.info(
             f"Reranker: initializing TypeSafe provider at {self.base_url} with model {self.model} "
-            f"(prune_candidates={self._prunes_by_cut}, resolve_conflicts={self._resolves_conflicts})"
+            f"(rank_mode={self.rank_mode}, prune_candidates={self._prunes_by_cut}, "
+            f"resolve_conflicts={self._resolves_conflicts})"
         )
 
     async def _ask(self, body: dict) -> dict:
@@ -1213,7 +1302,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     async def _rank_once(self, query: str, docs: list[str], indices: list[int]) -> list[int]:
         """Rank one group of candidates, returning their indices best first."""
         body = {
-            "state": f"Question: {query}",
+            "state": self._state(query),
             "model": self.model,
             "questions": {
                 "rank": {
@@ -1230,6 +1319,66 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         by_probability = sorted(range(len(indices)), key=lambda position: -float(probabilities[f"c{position}"]))
         return [indices[position] for position in by_probability]
 
+    def _state(self, query: str) -> str:
+        """The question's state: what is being asked, plus the framing every candidate shares."""
+        shared = rerank_shared_context.get()
+        return f"{shared}\n\nQuestion: {query}" if shared else f"Question: {query}"
+
+    async def _rank_pointwise(self, query: str, docs: list[str], indices: list[int]) -> list[int]:
+        """Rank by asking of each candidate separately whether it helps, best first.
+
+        One Noul per candidate, batched to the request ceiling. This asks a different
+        question from the listwise Choice: not "which of these is best" but "would this
+        one help", which is what a keep/drop decision over a whole pool needs. The Choice
+        ranks the head of the pool better — it is comparative, so it can only say which
+        beats which — while this scores every candidate on the same absolute scale, so the
+        order holds all the way down to where the caller's budget cuts.
+
+        A failed batch keeps its candidates in caller input order rather than dropping
+        them: an unranked candidate is recoverable, a deleted one is not.
+        """
+        budget = self.MAX_REQUEST_TOKENS - _REQUEST_OVERHEAD_TOKENS
+        batches: list[list[int]] = []
+        current: list[int] = []
+        current_tokens = 0
+        for index in indices:
+            item_tokens = count_tokens(docs[index]) + _KEEP_QUESTION_OVERHEAD
+            if current and (len(current) >= self.MAX_QUESTIONS or current_tokens + item_tokens > budget):
+                batches.append(current)
+                current, current_tokens = [], 0
+            current.append(index)
+            current_tokens += item_tokens
+        if current:
+            batches.append(current)
+
+        async def score(batch: list[int]) -> list[tuple[float, int]]:
+            questions = {
+                f"m{slot}": {
+                    "type": "noul",
+                    "instructions": {"task": _KEEP_INSTRUCTIONS, "memory": docs[index]},
+                }
+                for slot, index in enumerate(batch)
+            }
+            try:
+                answers = (
+                    await self._ask({"state": self._state(query), "model": self.model, "questions": questions})
+                )["answers"]
+            except Exception as e:
+                logger.warning(f"Reranker: TypeSafe pointwise batch failed, keeping its candidates unranked: {e}")
+                return [(0.0, index) for index in batch]
+            scored = []
+            for slot, index in enumerate(batch):
+                answer = answers.get(f"m{slot}") or {}
+                scored.append((float(answer.get("noul") or 0.0), index))
+            return scored
+
+        results = await asyncio.gather(*(score(batch) for batch in batches))
+        # Stable on the caller's input order, so equal scores keep their RRF order.
+        position = {index: slot for slot, index in enumerate(indices)}
+        flat = [pair for part in results for pair in part]
+        flat.sort(key=lambda pair: (-pair[0], position[pair[1]]))
+        return [index for _score, index in flat]
+
     async def _rank(self, query: str, docs: list[str], indices: list[int]) -> list[int]:
         """Rank a whole pool best first, in rounds when it exceeds option or token limits.
 
@@ -1243,7 +1392,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             return []
 
         # Available token budget for candidate options in one choice question.
-        state_tokens = count_tokens(f"Question: {query}")
+        state_tokens = count_tokens(self._state(query))
         # +30: cushion for the question's JSON framing (type, keys) around the instructions.
         instr_tokens = count_tokens(_rank_instructions(query)) + 30
         net_budget = max(50, self.MAX_QUESTION_TOKENS - state_tokens - instr_tokens)
@@ -1469,7 +1618,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             }
 
         try:
-            answers = (await self._ask({"state": f"Question: {query}", "model": self.model, "questions": questions}))[
+            answers = (await self._ask({"state": self._state(query), "model": self.model, "questions": questions}))[
                 "answers"
             ]
         except Exception as e:
@@ -1503,7 +1652,13 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         if count_tokens(query) > effective_query_cap:
             query = truncate_to_tokens(query, effective_query_cap).text
 
-        order = await self._rank(query, docs, indices)
+        # Judge each candidate on what is its own, not on the preamble they all carry.
+        own = _strip_shared_prefix(docs, indices)
+        docs = [own.get(index, doc) for index, doc in enumerate(docs)]
+        if self.rank_mode == RANK_MODE_POINTWISE:
+            order = await self._rank_pointwise(query, docs, indices)
+        else:
+            order = await self._rank(query, docs, indices)
         if self._resolves_conflicts:
             # Restatements go first: a cluster of five ways of saying the stale value is one
             # conflict, and resolving it five times spends five questions on one answer.
@@ -2647,6 +2802,7 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             max_concurrent=member.typesafe_max_concurrent,
             prune_candidates=member.typesafe_prune_candidates,
             resolve_conflicts=member.typesafe_resolve_conflicts,
+            rank_mode=member.typesafe_rank_mode,
         )
     elif provider == "rrf":
         return RRFPassthroughCrossEncoder()

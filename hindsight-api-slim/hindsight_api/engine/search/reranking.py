@@ -8,7 +8,13 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from ..cross_encoder import RerankTimeoutError, _served_provider, rerank_instructions
+from ..cross_encoder import (
+    DECISION_PROVIDERS,
+    RerankTimeoutError,
+    _served_provider,
+    rerank_instructions,
+    rerank_shared_context,
+)
 from .types import MergedCandidate, ScoredResult
 
 logger = logging.getLogger(__name__)
@@ -383,6 +389,17 @@ class CrossEncoderReranker:
                 provider_name=getattr(self.cross_encoder, "provider_name", None),
             )
 
+        # A decision model is handed the context they all share once, in the question's
+        # state, instead of pasted onto every candidate — see rerank_shared_context. Only
+        # when there is exactly one context to share; with several, each candidate keeps
+        # its own prefix, because then the difference between them is information.
+        contexts = {c.retrieval.context for c in candidates if c.retrieval.context}
+        shared_context = (
+            next(iter(contexts))
+            if len(contexts) == 1 and self.cross_encoder.primary_provider_name in DECISION_PROVIDERS
+            else None
+        )
+
         # Prepare query-document pairs with date information
         pairs = []
         for candidate in candidates:
@@ -390,7 +407,7 @@ class CrossEncoderReranker:
 
             # Use text + context for better ranking
             doc_text = retrieval.text
-            if retrieval.context:
+            if retrieval.context and not shared_context:
                 doc_text = f"{retrieval.context}: {doc_text}"
 
             # Add formatted date information for temporal awareness
@@ -417,6 +434,7 @@ class CrossEncoderReranker:
         unscored: set[int] = set()
         token = _served_provider.set(None)
         instructions_token = rerank_instructions.set(instructions)
+        shared_context_token = rerank_shared_context.set(shared_context)
         try:
             try:
                 # The model takes 2-tuples; `pairs` is built as two-element lists.
@@ -427,6 +445,7 @@ class CrossEncoderReranker:
                 scores = [0.0 if score is None else score for score in exc.scores]
             served_provider = _served_provider.get()
         finally:
+            rerank_shared_context.reset(shared_context_token)
             rerank_instructions.reset(instructions_token)
             _served_provider.reset(token)
         if served_provider is None:

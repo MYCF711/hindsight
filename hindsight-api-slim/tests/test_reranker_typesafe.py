@@ -16,6 +16,9 @@ from hindsight_api.config import HindsightConfig
 from hindsight_api.engine.cross_encoder import (
     _OPTION_KEY_OVERHEAD,
     TypeSafeCrossEncoder,
+    _strip_shared_prefix,
+    _value_payload,
+    rerank_shared_context,
     create_cross_encoder_from_env,
     rerank_instructions,
 )
@@ -42,9 +45,10 @@ class _FakeSession:
     real API would answer it.
     """
 
-    def __init__(self, ranking: dict[str, float], cut_level: float = 0.0):
+    def __init__(self, ranking: dict[str, float], cut_level: float = 0.0, keep: dict[str, float] | None = None):
         self.ranking = ranking
         self.cut_level = cut_level
+        self.keep = keep or {}
         self.posted: list[dict] = []
         self.urls: list[str] = []
 
@@ -56,6 +60,12 @@ class _FakeSession:
         self.urls.append(url)
         self.posted.append(json)
         question_id, question = next(iter(json["questions"].items()))
+        if question["type"] == "noul":
+            # One answer per question: a pointwise request carries many of them.
+            yield _FakeResponse(
+                {"answers": {key: {"type": "noul", "noul": self.keep.get(key, 0.0)} for key in json["questions"]}}
+            )
+            return
         if question["type"] == "choice":
             keys = list(question["criteria"])
             answer = {
@@ -91,6 +101,9 @@ def _encoder(
     max_question_tokens: int | None = None,
     **kwargs,
 ):
+    """An encoder for the listwise tests below. The mode is pinned rather than inherited
+    from the default, so these keep testing the Choice shape they are about."""
+    kwargs.setdefault("rank_mode", "listwise")
     encoder = TypeSafeCrossEncoder(api_key="k", **kwargs)
     if max_question_tokens is not None:
         encoder.MAX_QUESTION_TOKENS = max_question_tokens
@@ -319,6 +332,144 @@ class TestFactory:
         assert session.urls == ["https://proxy.example.com/v1/systemone"]
 
 
+class TestPointwiseRanking:
+    """One Noul per candidate: would showing this one help, rather than distract.
+
+    A Choice is comparative and ranks the head of a pool well; this puts every candidate on
+    one absolute scale, which is what holds the order down to wherever the caller's budget
+    cuts. It is the default for that reason.
+    """
+
+    def _encoder(self, keep: dict[str, float], **kwargs):
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=False, **kwargs)
+        session = _FakeSession({}, keep=keep)
+        encoder._session = session
+        return encoder, session
+
+    def test_it_is_the_default(self):
+        assert TypeSafeCrossEncoder(api_key="k").rank_mode == "pointwise"
+
+    def test_an_unknown_mode_is_refused(self):
+        with pytest.raises(ValueError, match="listwise"):
+            TypeSafeCrossEncoder(api_key="k", rank_mode="pairwise")
+
+    @pytest.mark.asyncio
+    async def test_the_scores_order_the_candidates(self):
+        encoder, _ = self._encoder({"m0": 0.1, "m1": 0.9, "m2": 0.5})
+        scores = await encoder._predict([("q", "a"), ("q", "b"), ("q", "c")])
+        assert scores[1] > scores[2] > scores[0]
+
+    @pytest.mark.asyncio
+    async def test_every_candidate_is_asked_about_and_the_query_is_the_state(self):
+        encoder, session = self._encoder({f"m{i}": 0.5 for i in range(3)})
+        await encoder._predict([("what changed?", "a"), ("what changed?", "b"), ("what changed?", "c")])
+        body = session.posted[0]
+        assert body["state"] == "Question: what changed?"
+        assert len(body["questions"]) == 3
+        assert [q["instructions"]["memory"] for q in body["questions"].values()] == ["a", "b", "c"]
+        assert all(q["type"] == "noul" for q in body["questions"].values())
+
+    @pytest.mark.asyncio
+    async def test_a_pool_over_the_question_cap_is_split_across_requests(self):
+        size = TypeSafeCrossEncoder.MAX_QUESTIONS + 5
+        encoder, session = self._encoder({f"m{i}": 0.5 for i in range(size)})
+        await encoder._predict([("q", f"candidate_{i}") for i in range(size)])
+        assert len(session.posted) == 2
+        assert sum(len(body["questions"]) for body in session.posted) == size
+
+    @pytest.mark.asyncio
+    async def test_candidates_scored_the_same_keep_their_input_order(self):
+        """Equal scores must not reshuffle the pool: input order is the RRF order."""
+        encoder, _ = self._encoder({f"m{i}": 0.5 for i in range(4)})
+        scores = await encoder._predict([("q", f"candidate_{i}") for i in range(4)])
+        assert scores[0] > scores[1] > scores[2] > scores[3]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_batch_keeps_its_candidates(self):
+        """An unranked candidate is recoverable; a deleted one is not."""
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=False)
+        session = _FakeSession({})
+
+        @asynccontextmanager
+        async def post(url, headers=None, json=None):
+            raise RuntimeError("upstream down")
+            yield  # pragma: no cover
+
+        session.post = lambda url, headers=None, json=None: post(url, headers=headers, json=json)
+        encoder._session = session
+        scores = await encoder._predict([("q", "a"), ("q", "b")])
+        assert len(scores) == 2 and all(score > 0.0 for score in scores)
+
+
+class TestSharedPreamble:
+    """Recall prefixes every candidate with its bank context, which on a single-conversation
+    bank is the same profile block on all of them. The decision provider judges and compares
+    what is each candidate's own."""
+
+    PROFILE = (
+        "Conversation 1 - USER PROFILE:\n"
+        "  Name: Craig Baker\n"
+        "  Age: 49 years old\n"
+        "  Gender: Male\n"
+        "  Location: Port Matthew\n"
+        "  Occupation: backend developer building a personal budget tracker\n"
+        "  Interests: cycling, cooking, open source\n"
+        "  Preferred stack: Flask, Postgres, plain CSS"
+    )
+
+    def test_a_preamble_every_candidate_shares_is_stripped(self):
+        docs = [f"{self.PROFILE}\nThe deadline is April 5", f"{self.PROFILE}\nThe team chose Postgres"]
+        assert _strip_shared_prefix(docs, [0, 1]) == {0: "The deadline is April 5", 1: "The team chose Postgres"}
+
+    def test_a_preamble_only_some_share_is_kept(self):
+        """Stripping needs the whole pool to agree, or it would cut real content."""
+        docs = [f"{self.PROFILE}\nalpha", f"{self.PROFILE}\nbeta", "no profile here"]
+        assert _strip_shared_prefix(docs, [0, 1, 2]) == {0: docs[0], 1: docs[1], 2: docs[2]}
+
+    def test_identical_candidates_keep_their_text(self):
+        """Stripping everything would leave nothing to rank."""
+        docs = ["same line", "same line"]
+        assert _strip_shared_prefix(docs, [0, 1]) == {0: "same line", 1: "same line"}
+
+    @pytest.mark.asyncio
+    async def test_the_shared_context_goes_in_the_state_once(self):
+        """Not onto each candidate: identical text cannot rank them, and it costs the
+        window once per candidate."""
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=False)
+        session = _FakeSession({}, keep={"m0": 0.9, "m1": 0.1})
+        encoder._session = session
+        token = rerank_shared_context.set(self.PROFILE)
+        try:
+            await encoder._predict([("q", "The deadline is April 5"), ("q", "The team chose Postgres")])
+        finally:
+            rerank_shared_context.reset(token)
+        body = session.posted[0]
+        assert body["state"] == f"{self.PROFILE}\n\nQuestion: q"
+        asked = [q["instructions"]["memory"] for q in body["questions"].values()]
+        assert asked == ["The deadline is April 5", "The team chose Postgres"]
+        assert all(self.PROFILE not in text for text in asked)
+
+    @pytest.mark.asyncio
+    async def test_the_preamble_does_not_reach_the_rank_question(self):
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=False)
+        session = _FakeSession({}, keep={"m0": 0.9, "m1": 0.1})
+        encoder._session = session
+        await encoder._predict(
+            [("q", f"{self.PROFILE}\nThe deadline is April 5"), ("q", f"{self.PROFILE}\nThe team chose Postgres")]
+        )
+        asked = [q["instructions"]["memory"] for q in session.posted[0]["questions"].values()]
+        assert asked == ["The deadline is April 5", "The team chose Postgres"]
+
+    def test_candidates_are_not_duplicates_once_the_preamble_is_gone(self):
+        """With it left in, 60 tokens of shared boilerplate put any two candidates over the
+        overlap threshold and dedupe reads them as restatements of each other."""
+        encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
+        with_preamble = [f"{self.PROFILE}\nalpha one", f"{self.PROFILE}\nbeta two"]
+        assert encoder._duplicates(with_preamble, [0, 1]) == {1}
+        own = _strip_shared_prefix(with_preamble, [0, 1])
+        assert encoder._duplicates([own[0], own[1]], [0, 1]) == set()
+
+
 class TestConflictResolution:
     """Which of two candidates that disagree states the current answer.
 
@@ -441,6 +592,28 @@ class TestConflictResolution:
         encoder = TypeSafeCrossEncoder(api_key="k", resolve_conflicts=True)
         docs = [self.STALE, self.CURRENT, self.OTHER]
         assert encoder._conflict_clusters(self.QUERY, docs, [0, 1, 2]) == [[0, 1]]
+
+
+class TestDateIsMetadataNotContent:
+    """Recall prefixes each candidate with its date. It belongs on the text the model ranks,
+    where a rule can prefer the more recent candidate, and nowhere near a comparison."""
+
+    DATE = "[Date: June 05, 2024 (2024-06-05)] "
+
+    def test_two_candidates_sharing_a_date_are_not_duplicates(self):
+        encoder = TypeSafeCrossEncoder(api_key="k")
+        docs = [f"{self.DATE}The team chose Postgres for storage", f"{self.DATE}The deadline moved to April 5"]
+        assert encoder._duplicates(docs, [0, 1]) == set()
+
+    def test_the_dates_digits_stay_out_of_the_value_payload(self):
+        """Otherwise 2024 and 06 read as the numbers the question turns on."""
+        assert _value_payload(f"{self.DATE}the deadline is April 5") == (frozenset({5}), frozenset({"april"}))
+
+    def test_the_date_still_reaches_the_ranked_text(self):
+        encoder = TypeSafeCrossEncoder(api_key="k")
+        docs = [f"{self.DATE}alpha", f"{self.DATE}beta"]
+        own = _strip_shared_prefix(docs, [0, 1])
+        assert all(value.startswith("[Date:") for value in own.values())
 
 
 class TestRerankerType:

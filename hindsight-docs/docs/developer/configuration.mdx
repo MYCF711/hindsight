@@ -1231,7 +1231,8 @@ ZeroEntropy's `zembed-1` supports Matryoshka dimensions: `2560`, `1280`, `640`, 
 | `HINDSIGHT_API_RERANKER_TYPESAFE_TIMEOUT` | HTTP request timeout for the TypeSafe reranker (seconds). | `60.0` |
 | `HINDSIGHT_API_RERANKER_TYPESAFE_MAX_CONCURRENT` | Maximum in-flight TypeSafe requests. | `24` |
 | `HINDSIGHT_API_RERANKER_INSTRUCTIONS` | Ranking rules in plain words, followed by decision-model rerankers (`typesafe`) instead of the recency/temporal boosts. Hierarchical: overridable per bank as `reranker_instructions`. See the TypeSafe note below. | Prefer newer facts on conflict; prefer facts dated near the time asked about |
-| `HINDSIGHT_API_RERANKER_TYPESAFE_RESOLVE_CONFLICTS` | Drop restatements, then ask which of a disagreeing set of candidates states the current answer and drop the superseded ones. Only fires on questions whose answer is a value. Shrinks what recall returns — see the note below. | `false` |
+| `HINDSIGHT_API_RERANKER_TYPESAFE_RANK_MODE` | How the pool is ranked: `pointwise` asks of each candidate separately whether it would help, `listwise` asks one comparative question over all of them. See the note below. | `pointwise` |
+| `HINDSIGHT_API_RERANKER_TYPESAFE_RESOLVE_CONFLICTS` | Drop restatements, then ask which of a disagreeing set of candidates states the current answer and drop the superseded ones. Only fires on questions whose answer is a value. Set `false` to return every candidate including superseded ones — see the note below. | `true` |
 | `HINDSIGHT_API_RERANKER_TYPESAFE_PRUNE_CANDIDATES` | Ask a second question that cuts the ranked list where relevance ends, returning only the relevant candidates. Shrinks what recall returns — see the note below. | `false` |
 | `HINDSIGHT_API_RERANKER_ALIBABA_API_KEY` | Alibaba Cloud DashScope API key for reranking | - |
 | `HINDSIGHT_API_RERANKER_ALIBABA_MODEL` | DashScope rerank model | `qwen3-rerank` |
@@ -1491,6 +1492,18 @@ The default restates what the boosts did:
 - When candidates conflict, prefer the one with the more recent date.
 - When the question is about a specific time, prefer candidates dated near that time.
 ```
+
+**Two ranking modes.** `listwise` asks one Choice whose options are the candidates. It is
+comparative — it can only say which candidate beats which — and it ranks the head of a pool
+well: recall@1 0.94 against 0.87 for one call per candidate on a 200-question set.
+`pointwise` (the default) asks of each candidate separately whether showing it would help
+rather than distract, which is the question a keep/drop decision over a whole pool turns on.
+Every candidate lands on one absolute scale, so the order holds down to wherever the
+caller's budget cuts instead of only at the top. Where a caller keeps dozens of memories and
+feeds them to a generator, that measured far better end to end — 0.79 against 0.59 on a
+20-question answer-quality set with everything else held equal — so it is the default. It
+costs one request per ~700 candidates; prefer `listwise` when only the top one or two
+matter.
 
 **Conflicts.** Ranking a pool against a question cannot tell that one candidate revises
 another: judged against the question, a stale value and the value that corrects it look
