@@ -2635,7 +2635,7 @@ class MemoryEngine(MemoryEngineInterface):
         self._db_acquire_timeout = db_acquire_timeout if db_acquire_timeout is not None else config.db_acquire_timeout
         self._db_statement_timeout = config.db_statement_timeout
         self._db_max_parallel_workers_per_gather = config.db_max_parallel_workers_per_gather
-        self._entity_trgm_similarity_threshold = config.entity_trgm_similarity_threshold
+        self._entity_trgm_similarity_threshold = config.entity_trgm_probe_threshold
         self._entity_merge_min_similarity = config.entity_merge_min_similarity
         self._run_migrations = run_migrations
         self._retain_entity_lookup = config.retain_entity_lookup

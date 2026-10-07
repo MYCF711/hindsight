@@ -1271,8 +1271,8 @@ class EntityResolver:
                 if labels_cfg and _is_label_entity(canonical_name, labels_cfg, taxonomy_lookup or set()):
                     continue
 
-                # The trigram probe admits candidates at a deliberately loose recall
-                # threshold (0.15), and the signals below can total 0.5 on their own — so
+                # The Oracle probe and the "full" fallback admit candidates far looser than
+                # this, and the signals below can total 0.5 on their own — so
                 # without a floor here a name merely *considered* similar could be merged
                 # onto purely because the bank had seen it recently next to the same
                 # entities (#3751). The two measures disagree most on short names, where a
