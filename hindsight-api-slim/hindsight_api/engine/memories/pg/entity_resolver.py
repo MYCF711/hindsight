@@ -952,7 +952,10 @@ class EntityResolver:
 
         Replaces pg_trgm for Oracle backends. Uses JSON_TABLE to expand the
         entity text list into rows (Oracle equivalent of PG's unnest), then
-        joins with a Jaro-Winkler threshold of 70/100 (≈ pg_trgm 0.15).
+        joins with a Jaro-Winkler threshold of 70/100 — looser than the trigram
+        merge floor, deliberately: Jaro-Winkler and trigram rank names differently,
+        so no JW cutoff maps onto that floor without dropping mergeable candidates.
+        The floor is applied afterwards in _resolve_from_candidates.
         Falls back to the "full" strategy if UTL_MATCH is unavailable.
         """
         entity_texts = list(set(e["text"] for e in entities_data))
@@ -969,7 +972,7 @@ class EntityResolver:
         try:
             # Batch entity texts into bounded sub-queries using JSON_TABLE to
             # expand the list into rows. UTL_MATCH.JARO_WINKLER_SIMILARITY
-            # returns 0-100; threshold 70 ≈ pg_trgm similarity 0.15.
+            # returns 0-100; threshold 70 is kept loose (see the docstring).
             # Bounded batches mirror the PG trigram path so very wide retain
             # batches don't time out a single JOIN on large banks.
             rows = []
