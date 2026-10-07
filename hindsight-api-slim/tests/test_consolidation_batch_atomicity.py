@@ -234,6 +234,10 @@ class _RecordingBatch:
     def __init__(self) -> None:
         self.commits = 0
         self.aborts = 0
+        self.prefetched: list[list[str]] = []
+
+    async def prefetch(self, unit_ids: list[str]) -> None:
+        self.prefetched.append(list(unit_ids))
 
     async def commit(self) -> None:
         self.commits += 1
@@ -275,6 +279,10 @@ async def test_each_response_is_handed_to_the_store_as_one_committed_batch(memor
         # consolidation_llm_batch_size=4 → two responses for six facts.
         assert len(opened) == 2
         assert [(b.commits, b.aborts) for b in opened] == [(1, 0), (1, 0)]
+        # Each response names the memories its actions read before reading any: one prefetch per
+        # batch, covering every create's sources (4 facts, then 2).
+        assert [len(b.prefetched) for b in opened] == [1, 1]
+        assert sorted(len(b.prefetched[0]) for b in opened) == [2, 4]
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
 

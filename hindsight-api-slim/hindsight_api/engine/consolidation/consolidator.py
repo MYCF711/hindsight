@@ -680,22 +680,21 @@ async def _sources_changed_since_read(
     return await get_memories().memories_changed_since(conn=conn, fq_table=fq_table, bank_id=bank_id, read_at=read_at)
 
 
-async def _any_live_source_memory(
-    conn: "DatabaseConnection",
-    bank_id: str,
-    source_memory_ids: list[uuid.UUID],
-) -> bool:
-    """Cheap, non-locking existence check used as a preflight before embedding.
+async def _live_source_ids(pool: DatabaseBackend, bank_id: str, unit_ids: list[Any]) -> set[str]:
+    """Which of ``unit_ids`` still exist, as strings — the preflight before embedding.
 
-    Lets the create/update executors skip the (slow) embedder when every source
-    memory is already gone, restoring the pre-refactor short-circuit. The
-    authoritative, FOR SHARE liveness check still runs inside the write transaction.
+    One read for a whole set, so a response's actions are checked together rather than one read
+    each. It only decides whether the (slow) embed is worth spending: the authoritative,
+    FOR SHARE liveness check still runs inside the write transaction. Outside a transaction the
+    share lock this reads with ends with the statement, so nothing is held.
     """
-    if not source_memory_ids:
-        return False
-    return await get_memories().any_memory_exists(
-        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=source_memory_ids
-    )
+    if not unit_ids:
+        return set()
+    async with acquire_with_retry(pool) as conn:
+        live = await get_memories().lock_live_memory_ids(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids
+        )
+    return {str(u) for u in live}
 
 
 def _unique_source_ids(v: str | list[str]) -> list[str]:
@@ -2500,6 +2499,10 @@ async def _process_memory_batch(
     # response's order, which the apply step relies on.
     prepare_slots = asyncio.Semaphore(_PREPARE_CONCURRENCY)
 
+    # Every action's sources are facts of this batch, so ONE liveness read answers the preflight
+    # for all of them, instead of one read per action.
+    live_before_prepare = await _live_source_ids(pool, bank_id, [m["id"] for m in memories])
+
     async def _bounded(coro: Any) -> Any:
         async with prepare_slots:
             return await coro
@@ -2522,15 +2525,14 @@ async def _process_memory_batch(
             return None
         agg = _aggregate_source_fields(source_mems, tags=fact_tags)
         source_memory_ids = [m["id"] for m in source_mems]
-        # Preflight (non-locking, short-lived conn): if every source memory is already gone,
-        # skip BEFORE the slow embed. The write itself re-checks liveness under FOR SHARE.
-        async with acquire_with_retry(pool) as conn:
-            if not await _any_live_source_memory(conn, bank_id, source_memory_ids):
-                logger.debug(
-                    f"Update skipped: all {len(source_memory_ids)} source memories for observation "
-                    f"{update.observation_id} were deleted before embedding"
-                )
-                return None
+        # Preflight: if every source memory is already gone, skip BEFORE the slow embed. The write
+        # itself re-checks liveness under FOR SHARE.
+        if not any(str(mid) in live_before_prepare for mid in source_memory_ids):
+            logger.debug(
+                f"Update skipped: all {len(source_memory_ids)} source memories for observation "
+                f"{update.observation_id} were deleted before embedding"
+            )
+            return None
         embedding_str = await _embed_observation_text(memory_engine, update.text, perf)
         prepared = _PreparedUpdate(
             update=update,
@@ -2597,12 +2599,9 @@ async def _process_memory_batch(
             )
             return None
 
-        async with acquire_with_retry(pool) as conn:
-            if not await _any_live_source_memory(conn, bank_id, create_source_ids):
-                logger.debug(
-                    f"Create skipped: all {len(create_source_ids)} source memories were deleted before embedding"
-                )
-                return None
+        if not any(str(mid) in live_before_prepare for mid in create_source_ids):
+            logger.debug(f"Create skipped: all {len(create_source_ids)} source memories were deleted before embedding")
+            return None
         embedding_str = await _embed_observation_text(memory_engine, create.text, perf)
         prepared_create = _PreparedCreate(
             text=create.text,
@@ -2661,6 +2660,19 @@ async def _process_memory_batch(
                             f"{len(changed_ids)} source fact(s) edited since read, e.g. {changed_ids[0]}"
                         )
                         prepared_deletes, prepared_updates, prepared_creates, stamp_ids = [], [], [], []
+
+                    # Each action below reads its sources (liveness, entities) and, for an update,
+                    # the observation it rewrites — one read at a time. Naming them all first lets
+                    # a store whose reads are round trips fetch them together.
+                    await write_batch.prefetch(
+                        list(
+                            dict.fromkeys(
+                                [str(mid) for p in prepared_updates for mid in p.source_memory_ids]
+                                + [p.update.observation_id for p in prepared_updates]
+                                + [str(mid) for p in prepared_creates for mid in p.source_memory_ids]
+                            )
+                        )
+                    )
 
                     for observation_id in prepared_deletes:
                         await _execute_delete_action(conn=conn, bank_id=bank_id, observation_id=observation_id)

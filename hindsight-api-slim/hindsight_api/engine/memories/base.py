@@ -533,6 +533,17 @@ class WriteBatch:
     that could observe it); the engine does not order its reads around the batch.
     """
 
+    async def prefetch(self, unit_ids: list[str]) -> None:
+        """Say which memories the batch's writes are about to read.
+
+        The engine names, up front, every memory the batch's actions will read one at a time, so a
+        store whose reads are round trips can fetch them in one and answer the rest from that. The
+        default does nothing: a SQL store reads them cheaply as it goes. A hint only — a store must
+        still answer a read of any id correctly, prefetched or not, and a read must still see the
+        batch's own writes.
+        """
+        return None
+
     async def commit(self) -> None:
         """Apply every write made in the batch. After this returns they are durable and visible."""
         return None
