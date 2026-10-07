@@ -155,6 +155,10 @@ logger = logging.getLogger(__name__)
 # prompt"; a request just under it that is still mostly instructions searches poorly.
 _FAST_QUERY_MAX_TOKENS = 80
 
+# Fast reflect's first recall, when the decision model will prune it: wide enough that a decision
+# the fused order ranks low still reaches the decision model, which re-ranks and cuts it.
+_FAST_RECALL_MAX_TOKENS = 8192
+
 DEFAULT_MAX_ITERATIONS = 10
 _COMPACTED_TOOL_RESULT = "[Earlier tool result omitted to fit the context budget; it is kept for the final answer.]"
 
@@ -857,6 +861,9 @@ async def _run_reflect_agent_inner(
         )
         total_llm_ms = sum(c["duration_ms"] for c in llm_trace)
         total_tools_ms = sum(t["duration_ms"] for t in tool_trace_summary)
+        # Neither an LLM/decision call nor a tool: prompt building, presentation, token
+        # counting, cache work. Parallel tools overlap, so this can go negative.
+        other_ms = elapsed_ms - total_llm_ms - total_tools_ms
 
         answer_preview = answer[:100] + "..." if len(answer) > 100 else answer
         mode = "forced" if forced else "done"
@@ -866,6 +873,7 @@ async def _run_reflect_agent_inner(
             f"iterations={iterations} | "
             f"llm=[{llm_summary}] ({total_llm_ms}ms) | "
             f"tools=[{tools_summary}] ({total_tools_ms}ms) | "
+            f"other={other_ms}ms | "
             f"tokens=in:{total_input_tokens},out:{total_output_tokens} | "
             f"answer='{answer_preview}' | "
             f"total={elapsed_ms}ms"
@@ -885,15 +893,20 @@ async def _run_reflect_agent_inner(
         """
         nonlocal total_input_tokens, total_output_tokens, total_cached_tokens, total_thoughts_tokens
         llm_start = time.time()
-        call_result = await llm_config.call(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            scope="reflect",
-            temperature=get_config().llm_temperature_reflect if temperature is None else temperature,
-            max_completion_tokens=completion_cap,
-        )
+        queue_wait = LLMQueueWait()
+        queue_token = set_queue_wait_sink(queue_wait)
+        try:
+            call_result = await llm_config.call(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                scope="reflect",
+                temperature=get_config().llm_temperature_reflect if temperature is None else temperature,
+                max_completion_tokens=completion_cap,
+            )
+        finally:
+            reset_queue_wait_sink(queue_token)
         response = call_result.content
         usage = call_result.usage
         llm_duration = int((time.time() - llm_start) * 1000)
@@ -905,6 +918,7 @@ async def _run_reflect_agent_inner(
             {
                 "scope": trace_scope,
                 "duration_ms": llm_duration,
+                "queued_ms": int(queue_wait.seconds * 1000),
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
             }
@@ -966,6 +980,8 @@ async def _run_reflect_agent_inner(
         if not messages or messages[-1].get("role") != "tool":
             return None
         llm_start = time.time()
+        queue_wait = LLMQueueWait()
+        queue_token = set_queue_wait_sink(queue_wait)
         try:
             result = await llm_config.call_with_tools(
                 messages=[
@@ -984,6 +1000,8 @@ async def _run_reflect_agent_inner(
         except Exception as e:
             logger.warning(f"[REFLECT {reflect_id}] closing done call failed, using the standalone prompt: {e}")
             return None
+        finally:
+            reset_queue_wait_sink(queue_token)
         total_input_tokens += result.input_tokens
         total_output_tokens += result.output_tokens
         total_cached_tokens += getattr(result, "cached_tokens", 0) or 0
@@ -996,6 +1014,7 @@ async def _run_reflect_agent_inner(
                 # be able to tell which path produced the answer.
                 "scope": "closing_done",
                 "duration_ms": int((time.time() - llm_start) * 1000),
+                "queued_ms": int(queue_wait.seconds * 1000),
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
             }
@@ -1197,7 +1216,11 @@ async def _run_reflect_agent_inner(
         if prune_evidence_fn is None:
             return tool_results
         prune_start = time.time()
-        pruned = await _prune_fast_batch(fast_search_query, tool_results, prune_evidence_fn, reflect_id)
+        # Ranked against the request itself, not the distilled query: the request says what to
+        # prefer ("decisions, never the current implementation"), and pruning on the short query
+        # kept the later commit that undid a decision as readily as the decision (sde-bench
+        # dedupe-history), so the answer reported the decision as superseded.
+        pruned = await _prune_fast_batch(query, tool_results, prune_evidence_fn, reflect_id)
         llm_trace.append({"scope": "fast_prune", "duration_ms": int((time.time() - prune_start) * 1000)})
         return pruned
 
@@ -1342,11 +1365,20 @@ async def _run_reflect_agent_inner(
                     query, "fast_query", FAST_SEARCH_QUERY_SYSTEM_PROMPT, None, temperature=0.0
                 )
                 fast_search_query = distilled.strip().strip('"') or query
+
+            # Without its reranker (see tools.skip_search_rerank) recall returns fused order, which
+            # can push the one fact that states a decision below the default slice: rank 63 of 95
+            # for sde-bench csvquote-history's, against 19 reranked. The decision model ranks what
+            # it is handed, so it is handed a wider slice and does the ordering itself.
+            def _fast_arguments(tool: str) -> dict[str, Any]:
+                arguments: dict[str, Any] = {"query": fast_search_query, "reason": "fast mode"}
+                if tool == "recall" and prune_evidence_fn is not None:
+                    arguments["max_tokens"] = _FAST_RECALL_MAX_TOKENS
+                return arguments
+
             result = LLMToolCallResult(
                 tool_calls=[
-                    LLMToolCall(
-                        id=f"fast_{tool}", name=tool, arguments={"query": fast_search_query, "reason": "fast mode"}
-                    )
+                    LLMToolCall(id=f"fast_{tool}", name=tool, arguments=_fast_arguments(tool))
                     for tool in forced_sequence
                 ],
                 finish_reason="tool_calls",

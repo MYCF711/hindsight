@@ -962,10 +962,17 @@ def build_done_request_prompt(
 #: ``mentioned_at`` to apply the latest-statement-wins supersession rule.
 # Fast reflect: a request too long to search with as written (a plugin's prompt wraps the
 # developer's goal in rendering rules) is first turned into one short search query.
+#
+# The query keeps what KIND of information is asked for, not only the subject: distilled to
+# "merge_records implementation logic", a request for decisions and their rationale pulled in
+# the later commit that broke the decision, which the answer then reported as superseding it
+# (sde-bench dedupe-history). Agent mode's own queries never asked for "implementation".
 FAST_SEARCH_QUERY_SYSTEM_PROMPT = (
     "You write search queries for a memory bank. Given a request, reply with ONE short search "
-    "query (at most 12 words) naming what the request needs to find: the subject, component, "
-    "decision or values it is about. Ignore instructions about how to format an answer. "
+    "query (at most 12 words) naming the subject (component, function, feature) and the kind of "
+    "information the request wants about it: a decision and why it was made, a value or limit, a "
+    "policy or rule, an event. Never add words like 'implementation', 'code' or 'logic' unless the "
+    "request asks how the code works. Leave out instructions about formatting the answer. "
     "Reply with the query only, no quotes."
 )
 

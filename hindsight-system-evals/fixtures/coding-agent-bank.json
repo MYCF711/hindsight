@@ -1,8 +1,0 @@
-{
-  "source": "AMB sde-bench boltons-budget-001, ingested by the coding-agents plugin (deepen) with the hindsight-coding memory arm",
-  "amb_ref": "5ad91b0a",
-  "hindsight_commit": "91dd69474",
-  "server_llm": "gemini/gemini-3.1-flash-lite",
-  "built": "2026-10-06",
-  "goal": "You are a maintainer of the `boltons-budget` Python project. A regression was reported:\n\nThe upstream is rate-limiting us \u2014 our Retrier retries well past where it should stop and crosses the rate-limit window. Restore the intended attempt budget. A failing repro is at tests/test_regression.py.\n\nFix the bug in the source code. Do NOT modify any test files \u2014 the graders supply their own.\nWork efficiently: find the root cause, make the smallest change that fixes it, run the failing test to confirm it passes (and existing behaviour still works), then stop \u2014 avoid unnecessary exploration.\nSave your changes to disk before finishing.\n"
-}
