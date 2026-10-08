@@ -23,6 +23,200 @@ import {
 } from "./missions";
 import { pool, semverGte, sleep } from "./util";
 import type { RetainStamp } from "./retain-stamp";
+import {
+  applyRecencyRerank,
+  recencyRerankDiagnostic,
+  rerankEnabled as RECENCY_ON,
+} from "./recency-rerank";
+
+/** ★ LOCAL FORK PATCH 2026-10-06: the provenance fields the injection layer reads off one recall
+ *  row. Upstream typed the response inline as `{ results?: { text?: string }[] }`, so every field
+ *  the ingest layer writes (asserted_by / scope / ttl / envelope_warnings) and every addressing
+ *  field the client returns (id / tags / chunk_id / source ids) was invisible here — not just to
+ *  the agent, but to the type system. Kept as a structural type with optional fields: an older
+ *  server simply omits them. */
+interface RecallMetadata {
+  asserted_by?: string;
+  scope?: string;
+  ttl?: string;
+  envelope_warnings?: unknown;
+}
+
+export interface RecallResultRow {
+  text?: string;
+  id?: string;
+  /** Alias the server uses for the record date on some rows (`date ?? mentioned_at`). */
+  date?: string;
+  mentioned_at?: string;
+  occurred_start?: string;
+  metadata?: RecallMetadata;
+  tags?: string[];
+  chunk_id?: string;
+  source_memory_ids?: string[];
+  source_fact_ids?: string[];
+  /** ★ LOCAL FORK PATCH 2026-10-07: entity cues the extractor attached to this row.
+   *  Read by the opt-in fan-out re-rank (see `applyFanoutPenalty`). Upstream's recall
+   *  response already carries this field; the type simply did not declare it because
+   *  nothing upstream read it. */
+  entities?: string[] | string;
+  /** ★ LOCAL FORK PATCH 2026-10-07: the score breakdown recall returns. The fan-out
+   *  re-rank needs a base score to penalize; `final` is the fused score and
+   *  `reranker` the stage before it. Declared because nothing upstream read them. */
+  scores?: { final?: number; reranker?: number; semantic?: number; keyword?: number | null };
+}
+
+// ★ LOCAL FORK PATCH 2026-10-06 (memory-timestamp): see recallObservations() for the rationale.
+// Default ON; HINDSIGHT_INJECT_DATES=0 restores upstream (no dates injected).
+const INJECT_DATES = (function (): boolean {
+  const v = process.env.HINDSIGHT_INJECT_DATES;
+  if (v === undefined || v === "") return true;
+  return !(v === "0" || v === "false" || v === "no");
+})();
+// ★ LOCAL FORK PATCH 2026-10-06: whether to show the ingest-time provenance fields
+// (asserted_by / scope / ttl) alongside each memory. See recallObservations().
+// ★ LOCAL FORK PATCH 2026-10-06: whether to show each memory's `id` and family tag on the
+// injected line. See recallObservations() — the injected instructions tell the agent to
+// look up rows "with the ids already shown above", so they must actually be shown.
+// ★ LOCAL FORK PATCH 2026-10-06: automatic chain closure. Each recalled row carries the
+// chunk_id it was extracted from; fetching its same-chunk siblings restores corrections
+// that similarity ranking dropped (measured: 95% of corrections missed, 100% recovered
+// by the sibling set, at p50 ~705 tokens). Set HINDSIGHT_CHAIN_CLOSURE=0 to disable.
+const INJECT_CHAIN = (function (): boolean {
+  const v = process.env.HINDSIGHT_CHAIN_CLOSURE;
+  // DEFAULT OFF (2026-10-06). Measured on the real 58k bank across 10 queries: chain closure
+  // adds 1.4x rows at 2.4x tokens, and only 5 of 70 added rows (7.1%) both shared an identifier
+  // with a recalled row AND negated it. The cause is that a chunk is an INGEST unit, not a topic
+  // unit - one chunk's conversation ranges over many subjects, so "same chunk" is a weak proxy
+  // for "same chain". Earlier "82% of corrections recovered" was measured on chunks pre-selected
+  // for containing a correction, which cannot be extrapolated to ordinary recall.
+  // Set HINDSIGHT_CHAIN_CLOSURE=1 to opt in.
+  if (v === undefined || v === "") return false;
+  return v === "1" || v === "true" || v === "yes";
+})();
+// Ceiling on rows after siblings merge in: the base recall is small (5 at the
+// interactive budget), so this permits a few chains without letting a 39-row chunk
+// crowd out the rows the query actually asked for.
+const INJECT_CHAIN_MAX_ROWS = (function (): number {
+  // `?? ""`: TS types env values as `string | undefined`; parseInt(undefined) and parseInt("")
+  // both yield NaN, so the fallback branch below is unchanged.
+  const v = parseInt(process.env.HINDSIGHT_CHAIN_MAX_ROWS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 12;
+})();
+// Distinct chunks expanded per turn, bounding sequential lookups.
+const INJECT_CHAIN_MAX_CHUNKS = (function (): number {
+  // `?? ""`: see INJECT_CHAIN_MAX_ROWS above — NaN either way.
+  const v = parseInt(process.env.HINDSIGHT_CHAIN_MAX_CHUNKS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 5;
+})();
+const INJECT_IDS = (function (): boolean {
+  const v = process.env.HINDSIGHT_INJECT_IDS;
+  if (v === undefined || v === "") return true;
+  return !(v === "0" || v === "false" || v === "no");
+})();
+const INJECT_META = (function (): boolean {
+  const v = process.env.HINDSIGHT_INJECT_META;
+  if (v === undefined || v === "") return true;
+  return !(v === "0" || v === "false" || v === "no");
+})();
+// ★ LOCAL FORK PATCH 2026-10-08 (narrow-tag visibility, v449/v450):
+//   Visible tag prefixes for the injection block. Was hardcoded ["trap","chain"] —
+//   the only inject switch in this file that did NOT read the environment.
+//   Now env-configurable; the default adds "story" so a story:<sessionId> tag can
+//   actually reach the agent. ORDER MATTERS: the renderer takes the first matching
+//   prefix, so trap/chain keep their existing precedence over story.
+//   Backwards compatible: HINDSIGHT_NARROW_TAGS=trap,chain restores old behaviour.
+const NARROW_TAG_PREFIXES = (function (): string[] {
+  const raw = process.env.HINDSIGHT_NARROW_TAGS;
+  const fallback = ["trap", "chain", "story"];
+  if (raw === undefined || raw === "") return fallback;
+  const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return parts.length ? parts : fallback;
+})();
+
+// ★ LOCAL FORK PATCH 2026-10-07 (fan-out penalty): re-rank recalled rows by "cue
+// distinctiveness" — a cue (entity) that appears in most candidates carries little
+// information, so a row supported only by ubiquitous cues should rank below one
+// supported by a rare cue.
+//
+// Basis — two independent sources in the literature review:
+//   · ACT-R's "difference penalty" (fan effect): activation falls with ln(fan)
+//   · Nairne's cue distinctiveness: a cue shared by many traces discriminates poorly
+//   ⇒ score = base − λ·ln(maxFan)
+//
+// ⚠ MEASURED STATUS — this is OFF by default and SHOULD STAY OFF, on evidence:
+//   A pre-registered controlled experiment (fork/D5-端到端对照实验.md) found the
+//   effect on TERMINAL ANSWER QUALITY is UNMEASURABLE with the proxies tried:
+//     · the primary proxy was falsified by its own control —
+//       BASE (production top-5) landed at the 18.1st percentile of a same-pool random
+//       draw while BOT5 (the 5 LOWEST-base rows) landed at the 29.1st
+//       ⇒ the metric judged the "worst" rows better than production top-5
+//     · root cause: Spearman(base score, literal-anchor coverage) = −0.486 —
+//       archive is a CONSOLIDATED bank, so high-scoring rows are abstract conclusions
+//       without filenames/ports, while literal-token rows are raw dumps
+//     · the secondary proxy was infeasible (6 of 8 candidate pools held zero
+//       correction rows)
+//   What IS established: the mechanism works — 8/8 queries change their top-5
+//   (M3 Δ = −2.125), and penalty stdev is 0.17–0.44 (not a constant shift).
+//   What is NOT established: that changing the top-5 improves anything.
+//   ⇒ With zero measured benefit but a 100%-of-queries change in ranking,
+//     enabling it by default is pure risk. Hence opt-in.
+//
+// The user's 2026-10-06 ruling ("先不接，保持现状") is thus independently confirmed
+// by experiment. Kept as a switchable capability so the question can be re-asked
+// with a better instrument (an LLM judge, or measuring downstream answer accuracy)
+// without re-implementing it.
+//
+// Set HINDSIGHT_FANOUT_PENALTY=1 to enable. HINDSIGHT_FANOUT_LAMBDA overrides λ.
+const FANOUT_PENALTY = (function (): boolean {
+  const v = process.env.HINDSIGHT_FANOUT_PENALTY;
+  if (v === undefined || v === "") return false;
+  return v === "1" || v === "true" || v === "yes";
+})();
+const FANOUT_LAMBDA = (function (): number {
+  const v = parseFloat(process.env.HINDSIGHT_FANOUT_LAMBDA ?? "");
+  return Number.isFinite(v) && v >= 0 ? v : 0.5;
+})();
+
+/** Entities of a recalled row, minus the `knowledge:` namespace.
+ *
+ *  ⚠ The exclusion is load-bearing, not cosmetic: `knowledge:decision`,
+ *  `knowledge:component` etc. are TYPE LABELS the extractor attaches, not entities.
+ *  Counting them as cues penalizes exactly the rows that were classified correctly
+ *  — measured on the real bank, `knowledge:decision` appears in 14 of 25 candidates,
+ *  so it would act as a near-constant penalty with the wrong sign. */
+function fanoutEntities(row: RecallResultRow): string[] {
+  const e = row.entities;
+  const arr: unknown[] = !e
+    ? []
+    : Array.isArray(e)
+      ? e
+      : String(e).split(",");
+  return arr
+    .map((s) => String(s).trim())
+    .filter(Boolean)
+    .filter((s) => !s.startsWith("knowledge:"));
+}
+
+/** Re-rank rows by distinctiveness. Pure: returns a NEW array, mutates nothing.
+ *
+ *  maxFan (not mean) is the statistic because ONE ubiquitous cue is enough to make a
+ *  row un-locatable; averaging would let four rare cues hide it.
+ *  ln() keeps the penalty slowly growing: fan 1 → 0, fan 25 → ~3.2. */
+function applyFanoutPenalty(rows: RecallResultRow[]): RecallResultRow[] {
+  const fan = new Map<string, number>();
+  for (const r of rows) {
+    for (const e of new Set(fanoutEntities(r))) {
+      fan.set(e, (fan.get(e) ?? 0) + 1);
+    }
+  }
+  const scored = rows.map((r) => {
+    const es = [...new Set(fanoutEntities(r))];
+    const maxFan = es.length ? Math.max(...es.map((e) => fan.get(e) ?? 1)) : 1;
+    const base = r.scores?.final ?? r.scores?.reranker ?? 0;
+    return { r, adj: base - FANOUT_LAMBDA * Math.log(Math.max(maxFan, 1)) };
+  });
+  return scored.sort((a, b) => b.adj - a.adj).map((x) => x.r);
+}
 
 /** One node of GET /knowledge-base/tree. Only the fields this client reads. */
 export interface KnowledgeNode {
@@ -48,6 +242,19 @@ export type ObservationScopes =
   | "all_combinations"
   | "per_source"
   | string[][];
+
+/**
+ * ★ FORK PATCH 2026-10-09 (v485): the server's five tag-matching modes.
+ *
+ * The distinction that matters here (measured on an isolated bank holding 2 tagged and
+ * 2 truly tag-LESS rows, identical on /memories/recall and /memories/list):
+ *   · `all` / `any`        — include rows with NO tags at all  ⇒ 4 rows
+ *   · `all_strict` / `any_strict` — exclude them               ⇒ 2 rows
+ *   · `exact`              — matched neither row set in that probe
+ * ⇒ `all` is right for "everything about project X", `all_strict` for "only rows that
+ *   really carry this story". The chain tool needs the latter.
+ */
+export type TagsMatchMode = "any" | "all" | "any_strict" | "all_strict" | "exact";
 
 /**
  * `per_source` is resolved HERE, per document, and never reaches the server: it expands to the
@@ -770,8 +977,420 @@ export class HindsightClient {
       opts.timeoutMs
     );
     if (r.status === 404) return [];
-    const j = (await r.json()) as { results?: { text?: string }[] };
-    return (j.results ?? []).map((x) => (x.text ?? "").trim()).filter(Boolean);
+    const j = (await r.json()) as {
+      results?: RecallResultRow[];
+      /** ★ LOCAL FORK PATCH 2026-10-06 (automatic chain closure): counters attached to the
+       *  response object when the sibling expansion below actually added rows. */
+      __chainClosure?: { added: number; siblings: number; corrective: number };
+      /** ★ LOCAL FORK PATCH 2026-10-07 (fan-out penalty): set only when the opt-in
+       *  re-rank actually ran, so a diagnostic can tell whether it was in play. */
+      __fanoutPenalty?: { lambda: number; rows: number };
+      /** ★ LOCAL FORK PATCH 2026-10-07 (recency): set only when the opt-in recency
+       *  re-rank actually re-ordered rows. It reports movement only — it makes no
+       *  claim that the new order is better, because that is not measured. */
+      __recencyRerank?: { rows: number; moved: number; maxShift: number; similarRel: number };
+    };
+    // ★ LOCAL FORK PATCH 2026-10-06 (memory-timestamp): prefix each memory with WHEN it was
+    // recorded. Rationale: the API already returns `mentioned_at` per result, but upstream
+    // threw it away here, so the agent saw a timeless assertion. That is how "the user was
+    // ill" (recorded 2025) reads, a year later, as "the user IS ill" — the agent has no way
+    // to notice the age and ask whether it still holds. The date is what makes a memory
+    // checkable against the present instead of merely believed.
+    //
+    // Cost control: date only (YYYY-MM-DD), not a full ISO timestamp — ~11 chars instead of
+    // ~30, and the time of day has never been the load-bearing part. Recent memories (within
+    // MEMORY_DATE_FRESH_DAYS) are left undated on purpose: "yesterday" needs no warning, and
+    // it keeps the common case cheap.
+    //
+    // Set HINDSIGHT_INJECT_DATES=0 to restore upstream behaviour.
+    //
+    // ★ LOCAL FORK PATCH 2026-10-06 (metadata envelope): also surface the provenance fields written
+    // at ingest time (asserted_by / scope / ttl / evidence_at). The whole point of storing them
+    // is lost if injection drops them: an agent cannot discount an inference it cannot see is an
+    // inference, and cannot re-check a temporary arrangement it cannot see is temporary. These
+    // are STRUCTURAL fields derived from the source (the JSONL `role`, explicit qualifier words)
+    // rather than from the summarizer's judgement, so they are the part of a memory that can be
+    // trusted more than its prose.
+    //
+    // Format: a compact `[YYYY-MM-DD|user|temporary]` prefix. Kept terse because it repeats on
+    // every line; only fields actually present are shown.
+    //
+    // ★ LOCAL FORK PATCH 2026-10-06 (addressable ids): also append the row's `id` and, when present,
+    // a family tag — because the injected prose says "walk the chain with the ids already shown
+    // above", and until now NO id was shown. An agent that followed that instruction literally
+    // had nothing to pass to the lookup tools, so a confidently-worded instruction produced three
+    // failed calls and a fallback to the misleading rows: the exact failure the instruction was
+    // meant to prevent. Measured by an independent tester: it could only proceed by guessing bank
+    // names from elsewhere. The ids are already in the API response; not showing them was a
+    // formatting loss, not an information gap.
+    //
+    // Kept to the tail so the provenance prefix stays at a fixed column: the eye (and the model)
+    // scans the left edge for `[date|who|scope]`.
+    // Set HINDSIGHT_INJECT_IDS=0 to omit the ids (they are also in hindsight_read_memory_chain).
+    // ★ LOCAL FORK PATCH 2026-10-06 (automatic chain closure): before formatting, expand the
+    // recalled rows with their same-chunk siblings — but only the ones worth the tokens.
+    //
+    // Why: recall ranks rows by similarity to the QUERY, so it hands back the claims that match
+    // the question and drops the corrections that contradict them — measured on the real 58k
+    // bank, querying with a claim retrieved its own correction 1 time in 20 (95% missed), while
+    // 287 of the chunks carrying a correction also carried the claim (99%). Asking the model to
+    // notice this and go looking only works if the model decides to investigate; this makes the
+    // pipeline do it instead.
+    //
+    // Cost, measured rather than assumed (6 real queries, 2026-10-06):
+    //   base recall          5 rows   ~250-1000 tokens
+    //   every sibling added 25-47 rows  6.8x tokens  <- too blunt, rejected
+    //   corrections first    3-14 rows  2.8x tokens  <- adopted
+    // Corrections are ~24% of siblings, so ordering them first buys most of the value at under
+    // half the cost. Compare the alternative this replaces: raising the candidate pool (budget
+    // low->mid) costs 4x latency (2.15s -> 8.38s, each arm pulls 300 -> 900 candidates) and
+    // still ranks by similarity alone. This is one indexed SQL lookup per chunk at ~115ms.
+    //
+    // Set HINDSIGHT_CHAIN_CLOSURE=0 to disable.
+    if (INJECT_CHAIN && j.results?.length) {
+      const seen = new Set((j.results ?? []).map((m) => m.id));
+      const chunks = [
+        ...new Set(
+          (j.results ?? [])
+            .map((m) => m.chunk_id)
+            .filter((c): c is string => Boolean(c))
+        ),
+      ];
+      const extra: RecallResultRow[] = [];
+      for (const ck of chunks.slice(0, INJECT_CHAIN_MAX_CHUNKS)) {
+        try {
+          for (const m of await this.listByChunk(ck)) {
+            if (m && m.id && !seen.has(m.id)) {
+              seen.add(m.id);
+              extra.push(m);
+            }
+          }
+        } catch (e) {
+          // A chain lookup that fails must not cost the caller its recall: the base rows are
+          // already in hand and are strictly better than nothing.
+        }
+      }
+      // Corrections first. The pattern is only a RANKING key, never a filter: a correction that
+      // fails to match is still included, just after the ones that do.
+      const CORRECTIVE =
+        /不是|并非|错误|更正|推翻|作废|查无|无法证实|未做验证|未验证|暂缓|反而|实际上|其实|\bnot\b|\bno longer\b|\bincorrect\b|\bsuperseded\b|\breversed\b|\bfalse\b|\bwrong\b|\brejected\b|\bfailed\b/i;
+      extra.sort(
+        (a, b) => (CORRECTIVE.test(b.text || "") ? 1 : 0) - (CORRECTIVE.test(a.text || "") ? 1 : 0)
+      );
+      const room = Math.max(0, INJECT_CHAIN_MAX_ROWS - j.results.length);
+      const add = extra.slice(0, room);
+      if (add.length) {
+        j.results = [...j.results, ...add];
+        j.__chainClosure = {
+          added: add.length,
+          siblings: extra.length,
+          corrective: add.filter((m) => CORRECTIVE.test(m.text || "")).length,
+        };
+      }
+    }
+    // ★ LOCAL FORK PATCH 2026-10-07 (fan-out penalty): opt-in re-rank. Applied AFTER
+    // chain closure so it re-orders the final set the formatter sees. Off by default —
+    // see FANOUT_PENALTY for the measurement that argues against enabling it.
+    if (FANOUT_PENALTY && j.results?.length) {
+      j.results = applyFanoutPenalty(j.results);
+      j.__fanoutPenalty = { lambda: FANOUT_LAMBDA, rows: j.results.length };
+    }
+    // ★ LOCAL FORK PATCH 2026-10-07 (recency): opt-in re-rank that lets a NEWER memory
+    // outrank an OLDER one when the two are comparably relevant. Runs last, after the
+    // fan-out penalty, so it sees the final ordering. It is NOT a time sort — a pure
+    // time ordering was measured to bury relevant-but-old rows at the very bottom;
+    // see src/core/recency-rerank.ts for the measurement and the tie-break rule.
+    //
+    // Off by default (HINDSIGHT_RECENCY_RERANK), which makes this a true no-op: with
+    // the flag unset applyRecencyRerank returns its input unchanged, so nothing here
+    // alters upstream behaviour. The mechanism is established and the threshold is
+    // calibrated; whether the agent then reuses retired approaches less often is not,
+    // so the default stays untouched until that is measured.
+    if (RECENCY_ON() && j.results?.length) {
+      const before = j.results;
+      const after = applyRecencyRerank(before);
+      if (after !== before) {
+        j.results = after;
+        j.__recencyRerank = recencyRerankDiagnostic(before, after);
+      }
+    }
+    return (j.results ?? [])
+      .map((x) => {
+        const text = (x.text ?? "").trim();
+        if (!text) return "";
+        const parts = [];
+        if (INJECT_DATES) {
+          const raw = x.mentioned_at || x.occurred_start;
+          if (raw) parts.push(String(raw).slice(0, 10));
+        }
+        if (INJECT_META) {
+          const md = x.metadata || {};
+          // Only the provenance fields written at ingest; ignore bookkeeping keys
+          // (bank/repo/harness) that carry no bearing on how much to trust the line.
+          const by = md.asserted_by;
+          if (by === "user" || by === "agent" || by === "tool" || by === "document") {
+            parts.push(by);
+          }
+          const sc = md.scope;
+          if (sc === "temporary") parts.push(md.ttl ? `temporary until ${md.ttl}` : "temporary");
+          else if (sc === "permanent") parts.push("permanent");
+          // `unspecified` is deliberately NOT shown: "unspecified" is the default state and
+          // printing it on most lines would be noise that trains the reader to skip the prefix.
+          //
+          // ★ LOCAL FORK PATCH 2026-10-06 (envelope warnings): the server-side envelope
+          // validator (lab/_ext/memory_envelope_validator.py) writes `envelope_warnings`
+          // at ingest, but nothing ever read it — so the checks were inert: they cost a
+          // write and changed no behaviour. Surfacing them here is what makes the pass
+          // over every retained item actually pay for itself.
+          //
+          // Reuses the existing `!` slot in the prefix rather than adding a new field,
+          // because the meaning is the same: "this line's qualifiers are suspect". A
+          // reader that already knows to distrust `!` needs no new instruction.
+          if (typeof md.envelope_warnings === "string" && md.envelope_warnings) {
+            parts.push("!");
+          }
+        }
+        const head = parts.length ? `[${parts.join("|")}] ` : "";
+        let tail = "";
+        if (INJECT_IDS) {
+          const bits = [];
+          if (x.id) bits.push(`id=${x.id}`);
+          // Surface ONE family tag — the `key:value` shape the chain tool takes. Prefer a
+          // namespaced tag over the bookkeeping ones every row carries (bank:, harness:, env:),
+          // which would point the agent at the whole bank.
+          //
+          // ★ Narrow tags only. An e2e run against the trap corpus surfaced a SUITE-WIDE tag
+          // (`suite:MEM-TRAP-SUITE`) shared by every case, so following it would have pulled
+          // several unrelated cases into context and buried the one being traced.
+          //
+          // And measured on the real archive (2026-10-06): `project:` / `topic:` / `bank:` style
+          // tags are not chains at all — `project:主工作区` alone matches 200 rows / ~25,500
+          // tokens, which is the entire slot window of the local server. Printing one invites an
+          // agent to fetch the whole bank and blow the window, so the injected line offers a tag
+          // ONLY when it plausibly identifies a small chain. A row with no such tag gets no tag,
+          // which is the honest answer: there is nothing narrow to follow.
+          const NARROW_TAGS = NARROW_TAG_PREFIXES;
+          const tags = (x.tags ?? []).filter((t) => typeof t === "string");
+          const tag = NARROW_TAGS.map((k) => tags.find((t) => t.startsWith(`${k}:`))).find(Boolean);
+          if (tag) bits.push(`tag=${tag}`);
+          // ★ LOCAL FORK PATCH 2026-10-06 (evidence edges): mark whether this row can be traced
+          // back to its source text, and say so in six characters.
+          //
+          // From the fusion design's two independently-derived rules:
+          //   ReMe  — "an agent may rewrite the wording, but it must not lose evidence edges"
+          //           (docs/en/memory_as_file.md:278)
+          //   Text2Mem — invariant ③: "every observation must carry source_ids, and injection
+          //           must present them alongside the original text"
+          //
+          // Measured on the real bank: the edges are fully intact — world/experience 100% carry a
+          // chunk_id, and observations 100% carry source_ids that reach one. But injection showed
+          // NEITHER, so `hindsight_read_source` looked unusable and the trail died at the summary.
+          // That is the same failure the fusion design warns about: the wording was rewritten (by
+          // design, and that is fine) while the edge that lets a reader check the rewriting was
+          // dropped (not fine, and invisible).
+          //
+          // Why a marker and not the id: a chunk_id is ~50 chars (`archive_conversation:session-
+          // <uuid>_60`), so printing one per row costs ~625 tokens across a 25-row injection. The
+          // lookup only needs the row's own `id`, which is already shown — so all the reader needs
+          // to know is WHICH rows are worth the call. Six chars carry that.
+          const traceable =
+            !!x.chunk_id ||
+            (Array.isArray(x.source_memory_ids) && x.source_memory_ids.length > 0) ||
+            (Array.isArray(x.source_fact_ids) && x.source_fact_ids.length > 0);
+          if (traceable) bits.push("src=Y");
+          if (bits.length) tail = `  (${bits.join(" ")})`;
+        }
+        return `${head}${text}${tail}`;
+      })
+      .filter(Boolean);
+  }
+
+  // ★ LOCAL FORK PATCH 2026-10-06 (lazy expansion / chain closure): list every memory extracted
+  // from one source chunk, by its `chunk_id`. See recallObservations() for why the sibling set,
+  // not a better ranker, is what recovers a dropped correction.
+  /** Every memory extracted from the SAME source chunk — the local exchange a row came from.
+   *
+   *  ★ Why this is the important one (measured 2026-10-06, on the real 58k bank):
+   *  A correction is nearly always recorded in the same chunk as the claim it corrects —
+   *  287 of the chunks carrying correction wording also carried the original claim (99%). But
+   *  recall ranks by similarity to the QUERY, and a correction is worded unlike the claim, so
+   *  querying with the claim retrieved the correction only 1 time in 20 (95% missed). Fetching
+   *  the sibling set by chunk recovered 19 of those 19 missed cases.
+   *
+   *  So this is a structural fix, not a bigger candidate pool: it does not raise `budget`
+   *  (measured: budget low->mid costs 4x latency, 2.15s -> 8.38s, because each retrieval arm
+   *  pulls 300 -> 900 candidates), does not depend on the model deciding to investigate, and
+   *  costs p50 ~705 tokens for the whole sibling set (max ~900; window is 24,576).
+   *
+   *  Requires the server-side `chunk_id` filter on /memories/list (added 2026-10-06). Against
+   *  an older server the parameter is silently ignored and this returns unfiltered rows, so
+   *  callers should treat an empty `chunk_id` on results as "filter unsupported". */
+  async listByChunk(chunkId: string, limit = 100): Promise<RecallResultRow[]> {
+    const q = `?limit=${limit}&chunk_id=${encodeURIComponent(chunkId)}`;
+    const r = await this.req("GET", this.bankUrl(`/memories/list${q}`), null, [404], 2e4);
+    if (r.status === 404) return [];
+    const j = (await r.json()) as { items?: RecallResultRow[]; memories?: RecallResultRow[] };
+    const items = j.items ?? j.memories ?? [];
+    // Guard against a server predating the filter: it would return unrelated rows. Verifying
+    // locally costs nothing and turns a silent wrong answer into an empty one.
+    return items.filter((m) => !m.chunk_id || String(m.chunk_id) === String(chunkId));
+  }
+
+  // ★ LOCAL FORK PATCH 2026-10-06 (lazy expansion): fetch ONE memory by id.
+  //
+  // Why this exists: recall returns at most `rerank_max_candidates` rows (5 by default for the
+  // interactive budget), chosen by a ranker that scores topical similarity. A memory that is
+  // far from the query's topic but decisive for the answer — a later correction, a "this was a
+  // test" note, a qualifier recorded in a different session — simply cannot survive that cut.
+  // Measured on the trap corpus: the chain's terminal layer ranked 70th of 106 candidates, so
+  // no wording change can pull it in. The fix is not a better ranker but giving the agent the
+  // means to walk the chain itself: every returned row already carries `id`, so it can ask for
+  // a specific neighbour once it suspects the injected set is partial.
+  async getMemory(memoryId: string): Promise<RecallResultRow> {
+    const r = await this.req("GET", this.bankUrl(`/memories/${encodeURIComponent(memoryId)}`));
+    if (r.status === 404) throw new Error(`memory not found: ${memoryId}`);
+    return (await r.json()) as RecallResultRow;
+  }
+
+  /** The original text a memory was extracted from, by chunk id (recall returns `chunk_id`).
+   *  This is the verbatim trace — the only layer that can settle whether a summary distorted
+   *  its source, since the summary has already rewritten the wording. */
+  async getChunk(chunkId: string): Promise<unknown> {
+    // ★ FORK BUGFIX 2026-10-07: this path was missing `${this.apiUrl}`, so `req` received a
+    // RELATIVE url and every call died inside fetch with
+    //   "Failed to parse URL from /v1/default/chunks/… (ERR_INVALID_URL)"
+    // — i.e. `hindsight_read_chunk` had NEVER once succeeded, and because `getSource` calls this
+    // method twice, `hindsight_read_source` was dead too (2 of the 4 chain tools).
+    //
+    // Verified against the live server before fixing:
+    //   GET {apiUrl}/v1/default/chunks/<chunk_id>             -> 200   (the correct path)
+    //   GET {apiUrl}/v1/default/banks/<bank>/chunks/<id>      -> 404   (NOT under /banks/)
+    // The chunk endpoint is deliberately bank-less, so `bankUrl()` is the WRONG helper here —
+    // only the apiUrl prefix was missing. Same shape as the `/version` call above.
+    const r = await this.req(
+      "GET",
+      `${this.apiUrl}/v1/default/chunks/${encodeURIComponent(chunkId)}`
+    );
+    if (r.status === 404) throw new Error(`chunk not found: ${chunkId}`);
+    return await r.json();
+  }
+
+  /** All memories carrying a tag. Used for chain completion: when a row belongs to a tagged
+   *  family (recall already returns its `tags`), this pulls the siblings an agent would
+   *  otherwise never see — the later correction, the "this was a test" note, the qualifier
+   *  recorded in another session. Measured 2026-10-06: the chain-completion query returns 24
+   *  rows where interactive recall returned 5, and it is the only path that reaches a
+   *  terminal layer ranked 70th of 106 candidates.
+   *
+   *  NOTE: the parameter is `tags`, not `tag`. `?tag=` is silently IGNORED by the server —
+   *  it returns an unfiltered page rather than an error, which looks like success. */
+  async listByTag(
+    tag: string,
+    limit = 50,
+    // ★ FORK PATCH 2026-10-09 (v485): expose `tags_match`.
+    //   Measured on an isolated bank holding 2 tagged + 2 truly tag-LESS rows:
+    //     no tags_match (= what this method used to send) ⇒ 4 rows, INCLUDING the 2 tag-less
+    //     all                                            ⇒ 4 rows (identical)
+    //     all_strict                                     ⇒ 2 rows, tag-less = 0
+    //   Same on /memories/recall and /memories/list ⇒ server behaviour, not an endpoint quirk.
+    //   ⇒ without this parameter the chain tool can only express `all`, so a story lookup drags
+    //     in every untagged memory — on the real archive that is 84.9% of rows.
+    //   ⚠ Default kept at "all" ON PURPOSE: that is exactly the previous behaviour, so this
+    //     change is purely additive and cannot alter any existing caller. The tool asks for
+    //     "all_strict" explicitly.
+    tagsMatch: TagsMatchMode = "all"
+  ): Promise<RecallResultRow[]> {
+    // ★ Cap the page size. Measured on the real archive: `project:主工作区` alone matches 200
+    // rows / ~25,500 tokens — more than the local server's whole per-slot window. The chain
+    // tool exists to fetch a SMALL family, so an over-broad tag must degrade to a truncated
+    // answer rather than a blown context. 200 is the server's own page ceiling.
+    limit = Math.min(Number(limit) || 50, 200);
+    const q =
+      `?limit=${limit}&tags=${encodeURIComponent(tag)}` +
+      `&tags_match=${encodeURIComponent(tagsMatch)}`;
+    const r = await this.req("GET", this.bankUrl(`/memories/list${q}`), null, [404], 2e4);
+    if (r.status === 404) return [];
+    const j = (await r.json()) as { items?: RecallResultRow[]; memories?: RecallResultRow[] };
+    return j.items ?? j.memories ?? [];
+  }
+
+  /**
+   * ★ LOCAL FORK PATCH 2026-10-08 (tag discovery, v447/v452): enumerate the tags that
+   * exist in this bank, with how many memories carry each one.
+   *
+   * Why this exists: every other tag-aware tool takes a tag as INPUT. `read_memory_chain`
+   * says so outright — its tag is "taken from a recalled memory's `tags`" — so with no way
+   * to LIST tags, a family that never happened to surface in a recall is unreachable. That
+   * is exactly the story-line case: `story:<sessionId>` tags are minted per session and
+   * the agent cannot guess a session id.
+   *
+   * Endpoint contract (probed 2026-10-08 on a 25-story isolated bank):
+   *   GET /tags ⇒ 200 {"items":[{"tag":"env:local","count":4282},…],"total":N,"limit":L,"offset":O}
+   *   Server-side paging works: `?limit=5` ⇒ 5 items; `?offset=5` ⇒ 23 of 28.
+   *   `?prefix=` and `?tag=` are ignored by the server; `?q=` exists but is not a
+   *   prefix filter (returned 0 for the string "story"). So filtering happens here.
+   */
+  async listTags(opts: { limit?: number; offset?: number; prefix?: string } = {}): Promise<
+    Array<{ tag: string; count: number }>
+  > {
+    const limit = Math.min(Math.max(Number(opts.limit) || 200, 1), 1000);
+    const offset = Math.max(Number(opts.offset) || 0, 0);
+    const q = `?limit=${limit}&offset=${offset}`;
+    const r = await this.req("GET", this.bankUrl(`/tags${q}`), null, [404], 2e4);
+    if (r.status === 404) return [];
+    const j = (await r.json()) as { items?: Array<{ tag?: unknown; count?: unknown }> };
+    let rows = (j.items ?? [])
+      .map((x) => ({ tag: String(x.tag ?? ""), count: Number(x.count) || 0 }))
+      .filter((x) => x.tag !== "");
+    // `prefix` is applied client-side: the server ignores it (see the contract note above).
+    if (opts.prefix) rows = rows.filter((x) => x.tag.startsWith(opts.prefix as string));
+    return rows;
+  }
+
+  /** Reach the verbatim source of ANY memory, following the fact layer when needed.
+   *
+   *  Why this exists (measured 2026-10-06): consolidated observations — the layer carrying a
+   *  project's settled conclusions, and on the trap corpus EVERY decisive terminal row — have
+   *  NO chunk_id. They record provenance in `source_memory_ids` instead, pointing at the facts
+   *  they were merged from, and only those facts carry a chunk_id. So a plain "read the chunk"
+   *  step dead-ends on exactly the rows most worth checking. This method walks that hop, so the
+   *  caller does not need to know the schema.
+   *
+   *  Returns { memory, source_facts, chunk, hops }. */
+  async getSource(memoryId: string): Promise<{
+    memory: RecallResultRow;
+    source_facts: unknown[];
+    chunk: unknown;
+    hops: number;
+  }> {
+    const m = await this.getMemory(memoryId);
+    const out: {
+      memory: RecallResultRow;
+      source_facts: unknown[];
+      chunk: unknown;
+      hops: number;
+    } = { memory: m, source_facts: [], chunk: null, hops: 0 };
+    if (m.chunk_id) {
+      out.chunk = await this.getChunk(m.chunk_id);
+      out.hops = 1;
+      return out;
+    }
+    const ids = m.source_memory_ids || (m as { source_fact_ids?: string[] }).source_fact_ids || [];
+    for (const sid of ids.slice(0, 5)) {
+      try {
+        const sf = await this.getMemory(sid);
+        out.source_facts.push(sf);
+        if (sf.chunk_id && !out.chunk) {
+          out.chunk = await this.getChunk(sf.chunk_id);
+          out.hops = 2;
+        }
+      } catch (e) {
+        // A source fact may have been superseded or deleted; keep walking rather than fail the
+        // whole lookup over one missing hop.
+        out.source_facts.push({ id: sid, error: String(e).slice(0, 200) });
+      }
+    }
+    return out;
   }
 
   /**
