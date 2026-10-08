@@ -53,52 +53,52 @@ function indexLine(pages: PageRef[]): string {
  * context. (Omits hindsight_diagnose — pure troubleshooting, no workflow trigger.)
  */
 const TOOL_GUIDE =
-  "- hindsight_search_knowledge_pages(query) — FIRST STOP, and the way IN to everything below. The code " +
-  "shows what is true today but not what was decided or why; memory shows what was decided or said " +
-  "back then but not whether it still holds. Work built from either alone goes wrong: from code alone " +
-  "it quietly re-litigates settled questions, from memory alone it acts on stale claims. Search " +
-  "BEFORE you act whenever the turn is one of these — they are the ones that go wrong silently:\n" +
-  "    • the user reports a bug or a wrong response (the intended behaviour, and the status code or " +
-  "value it should return, may already have been decided);\n" +
-  "    • you are about to write or change a test (what this project expects a change to ship with, and " +
-  "how it asserts, is a convention, not a preference);\n" +
+  "- hindsight_search_knowledge_pages(query) — FIRST STOP, and the way IN to everything below. " +
+  "The code shows what is true today but not what was decided or why; memory shows what was decided " +
+  "back then but not whether it still holds — each alone misleads. Search BEFORE you act when:\n" +
+  "    • the user reports a bug or a wrong response (the intended behaviour may already be decided);\n" +
+  "    • you are about to write or change a test (how it asserts is a convention, not a preference);\n" +
   "    • you are implementing something new, or two parts have to fit together;\n" +
   "    • the user asks why something is the way it is, or what is left to do;\n" +
   "    • you are about to commit, and need to know what the change was supposed to honour.\n" +
-  "  It ranks the pages by relevance and returns the matching passage, which a page title cannot tell " +
-  "you. What it returns is a past record, not a live reading: a claim that something was fixed, " +
-  "passes, or works is what someone said then — check it against the code before you rely on it, " +
-  "and say so when the two disagree.\n" +
-  "  CREDITING IS NOT OPTIONAL AND NOT A JUDGEMENT CALL. If you called this tool and anything it " +
-  "returned reached your reply — quoted, paraphrased, or merely confirming what you were about to " +
-  "say — open that part with a markdown blockquote, exactly: " +
-  '"> 🧠 **From Hindsight memory (<page>)** — <the specific facts you drew on>". Rewriting a ' +
-  "snippet in your own words does not make it yours. A search that turned up nothing useful needs " +
-  "no mention at all — just carry on.\n" +
-  "- hindsight_list_knowledge_pages / hindsight_read_knowledge_page — BEFORE substantial work, list the pages and " +
-  "read the relevant ones to ground yourself in this repo's architecture, conventions, and past decisions instead " +
-  "of re-deriving them from the code; follow any [[page:<id>]] links you see.\n" +
-  "- hindsight_reflect(query) — when pages are too shallow and you need the WHY: deep reasoning over the " +
-  "repo's full memory for the past decision and exact values that explain a behavior or bug (slower — " +
-  'use deliberately, and credit results with a blockquote header "> 🧠 **From Hindsight memory** — <summary>").\n' +
-  "- hindsight_capture_initiative(title, summary) — right after the user approves a plan or finishes brainstorming a " +
-  "new feature/capability and you are about to start implementing (BEFORE you write any code), call this to " +
-  "record it as a tracked page; then call it AGAIN with relates_to_page_id set to that page whenever the goal, " +
-  "scope, or rationale materially changes mid-work, so the page tracks the current plan and not the opening one. " +
-  "Skip bug fixes, small tweaks, chores, and trivial course-corrections.\n" +
-  "- hindsight_ingest_document(title, content) — save an external document or durable notes/findings you want " +
-  "remembered (not the current conversation — that is captured automatically at session end).";
+  "  It ranks pages by relevance; what it returns is a past record, not a live reading — check a claim " +
+  "against the code before relying on it.\n" +
+  "  CREDITING IS NOT OPTIONAL AND NOT A JUDGEMENT CALL: if anything it returned reached your reply — " +
+  "quoted, paraphrased, or merely confirming what you were about to say — open that part with " +
+  '"> 🧠 **From Hindsight memory (<page>)** — <the specific facts you drew on>". Rewriting a snippet ' +
+  "in your own words does not make it yours. A search that found nothing useful needs no mention.\n" +
+  "- hindsight_list_knowledge_pages / hindsight_read_knowledge_page — BEFORE substantial work, read the " +
+  "relevant pages instead of re-deriving this repo's conventions and past decisions from the code; " +
+  "follow any [[page:<id>]] links.\n" +
+  "- hindsight_reflect(query) — when those pages are too shallow and you need the WHY: deep reasoning " +
+  'over the full memory (slower; credit with "> 🧠 **From Hindsight memory** — <summary>").\n' +
+  "- hindsight_capture_initiative(title, summary) — right after the user approves a plan or finishes " +
+  "brainstorming a new capability, and BEFORE you write any code, record it as a tracked page; call it " +
+  "AGAIN with relates_to_page_id set to that page whenever the goal, scope, or rationale materially " +
+  "changes mid-work, so the page tracks the current plan. Skip bug fixes, chores and trivial " +
+  "course-corrections.\n" +
+  "- hindsight_ingest_document(title, content) — save an external document or durable notes worth " +
+  "remembering (not the current conversation — it is captured automatically at session end).\n" +
+  // ★ FORK PATCH 2026-10-08 (tag discovery, v457): the tag LISTING tool.
+  //   Without this line the agent has the tool registered but no reason to reach for it —
+  //   every sibling tag tool takes a tag as INPUT (hindsight_read_memory_chain says so
+  //   outright), so a family whose name a recall never surfaced is unreachable.
+  //   That is exactly the per-session story-tag case, where the name is a uuid.
+  "- hindsight_list_tags(prefix) — the tags that EXIST in this bank, with counts. Use it to find " +
+  "a family you cannot name (a tag a recall never surfaced is otherwise unreachable), then read " +
+  "it with hindsight_read_memory_chain. Pass a prefix (e.g. 'story:') to narrow.\n" +
+  // ★ FORK PATCH 2026-10-08 (self-check tools, v458/v459): the two tools an agent needs when
+  //   MEMORY ITSELF looks broken. Neither is part of the normal workflow (sync is automatic;
+  //   diagnose is for when something looks off). v459 measured the three additions this session
+  //   at +792 chars against TOOL_GUIDE's 2259 (the post-plan-B value) — this trim gives some back.
+  "- hindsight_sync_status() — still ingesting? (automatic; nothing to run).\n" +
+  "- hindsight_diagnose() — safe runtime diagnostics; use when memory, hooks or config appear " +
+  "NOT to work, instead of concluding the bank is empty.";
 
-/**
- * Any autoInject other than "reflect" means no first-prompt synthesis. Keep the pull trigger explicit,
- * but start with the curated pages: they are the fast path, while reflection is the slower fallback
- * when those pages do not contain enough depth for the new goal.
- */
 const PAGES_FIRST_ON_GOALS =
   "- The user just set a NEW task or goal → search the knowledge pages FIRST with " +
   "hindsight_search_knowledge_pages. No synthesis is injected automatically in this configuration; " +
   "call hindsight_reflect only when those pages are too shallow and deeper reasoning is needed.\n";
-
 export interface ToolGuideOpts {
   /** Add the new-goal pull trigger (no automatic synthesis: cfg.autoInject !== "reflect"). It used to send
    *  the agent straight to hindsight_reflect; it now goes to the knowledge pages first and keeps
