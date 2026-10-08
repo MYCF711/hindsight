@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parsePageList, buildKnowledgePreamble, buildRosterRefresh } from "./knowledge-injection";
+import { buildSystemInjection } from "./inject";
 
 describe("parsePageList", () => {
   it("extracts {id,title} from the page list shape, tolerating junk", () => {
@@ -41,6 +42,96 @@ describe("buildKnowledgePreamble", () => {
     expect(out).toContain("hindsight_reflect");
     expect(out).toContain("hindsight_capture_initiative");
     expect(out).toContain("hindsight_ingest_document");
+  });
+
+  // ★ FORK PATCH（v485）：新增的 tags_match 参数也要在说明里出现 ——
+  //   否则又是「工具实现了但 agent 不知道能传」的老问题（v457 的翻版）。
+  it("names the chain tool's tags_match parameter in the injected memory block", () => {
+    const out = buildSystemInjection("some recalled line");
+    expect(out).toContain("hindsight_read_memory_chain(tag,tags_match)");
+    expect(out).toContain("all_strict");
+  });
+
+  // ★ FORK PATCH（v458）：补一条【完整性】守卫，替代逐个人工列举的清单。
+  //   由来：v457 补 list_tags 时，我又是「发现一个、补一个」。随后做全量核查，
+  //   发现 sync_status / diagnose 两个工具在两处说明里【都】没有 —— 同一缺口的第二、三例。
+  //   ⇒ 与其继续手工列举，不如断言「注册的工具集 ⊆ 说明提到的工具集」。
+  //   ⚠ 两个函数分工不同，合起来才算「说明」：
+  //        · buildKnowledgePreamble ＝ TOOL_GUIDE
+  //        · buildSystemInjection   ＝ <hindsight_memory> 走链块
+  it("mentions EVERY registered tool somewhere in the injected guidance", async () => {
+    const { buildKnowledgeTools } = await import("./knowledge-tools");
+    // 本测试只取「工具名清单」，不驱动行为 —— stub 只需存在。
+    const stub = {} as unknown as import("./hindsight").HindsightClient;
+    const registered = buildKnowledgeTools(stub, "repo-a").map((t) => t.name);
+
+    const guidance =
+      buildKnowledgePreamble([{ id: "p1", title: "Component map" }]) +
+      "\n" +
+      buildSystemInjection("some recalled line");
+
+    const unmentioned = registered.filter((name) => !guidance.includes(name));
+    // 失败信息要直接列出漏了谁，而不是只给一个 true/false。
+    expect(unmentioned, `tools absent from the injected guidance: ${unmentioned.join(", ")}`).toEqual(
+      []
+    );
+  });
+
+  // ★ FORK PATCH（v460）：上一条守卫只管「注册了 ⇒ 要提到」，反方向没人管 ——
+  //   说明里若出现一个【并未注册】的工具名（改名/删除后漏改说明），agent 照着调用
+  //   必然得到 "unknown tool"，而且这类错误极难从会话里自查（它看起来像工具坏了）。
+  //   ⇒ 断言「说明里提到的 hindsight_* ⇒ 必须是注册过的工具名」。
+  //   ⚠ 只校验 hindsight_ 前缀的名字：说明里还有 history:... 之类的非工具标识。
+  it("mentions no hindsight tool that is not actually registered (no ghost tools)", async () => {
+    const { buildKnowledgeTools } = await import("./knowledge-tools");
+    const stub = {} as unknown as import("./hindsight").HindsightClient;
+    const registered = new Set(buildKnowledgeTools(stub, "repo-a").map((t) => t.name));
+
+    const guidance =
+      buildKnowledgePreamble([{ id: "p1", title: "Component map" }]) +
+      "\n" +
+      buildSystemInjection("some recalled line");
+
+    // ⚠ 先剥掉【包裹标签】：说明里用 <hindsight_knowledge> / <hindsight_memory> /
+    //   <hindsight_knowledge_refresh> 三个非工具标识做外壳，它们不是工具名。
+    //   第一版正则没排除它们，守卫立刻把 hindsight_knowledge / hindsight_memory 报成幽灵工具。
+    const withoutWrapperTags = guidance.replace(/<\/?hindsight_[a-z_]+>/g, " ");
+    const mentioned = new Set(withoutWrapperTags.match(/hindsight_[a-z_]+/g) ?? []);
+    const ghosts = [...mentioned].filter((name) => !registered.has(name));
+    expect(ghosts, `tool names in the guidance that are NOT registered: ${ghosts.join(", ")}`).toEqual(
+      []
+    );
+    // 反向保险：这条断言只在真的解析出名字时才有意义（防止正则失效后静默通过）。
+    expect(mentioned.size).toBeGreaterThanOrEqual(registered.size);
+  });
+
+  // ★ FORK PATCH（tag discovery，v457）：这条守卫是补出来的 ——
+  //   加 hindsight_list_tags 时，工具本身注册好了、测试也过了，但【注入给 agent 的说明里
+  //   一处都没提它】。一个 agent 不知道存在的工具等于不存在。
+  //   本文件上方「Every meaningful tool must be named」正是为这类缺口写的守卫，
+  //   而上面那组断言的清单比工具集【旧】—— 所以这里补上。
+  //   ⚠ 两个函数分工不同，断言也要分开写（我第一版把它们混在一起，测试立刻指出了）：
+  //     · buildKnowledgePreamble（本文件）＝ TOOL_GUIDE：页面/反思/记录类工具
+  //     · inject.ts 的注入块          ＝ 走链清单：read_* 四件套 + 本轮的 list_tags
+  it("names the tag-discovery tool in the preamble's tool guide", () => {
+    const out = buildKnowledgePreamble([{ id: "p1", title: "Component map" }]);
+    // 发现工具：没有它，只出现在某个 family 标签下、从未被召回过的行就够不着。
+    expect(out).toContain("hindsight_list_tags");
+    expect(out).toContain("hindsight_read_memory_chain"); // 说明它之后的用法
+  });
+  it("names every chain tool (plus the tag lister) in the injected memory block", () => {
+    // buildSystemInjection 输出的是 <hindsight_memory> 块 —— agent 每轮真正读到的走链指引。
+    // 它和 TOOL_GUIDE 是两个不同的函数，所以两处都得点名，缺一处就等于缺一条路。
+    const out = buildSystemInjection("some recalled line");
+    for (const t of [
+      "hindsight_read_memory",
+      "hindsight_read_chunk",
+      "hindsight_read_memory_chain",
+      "hindsight_read_source",
+      "hindsight_list_tags",
+    ]) {
+      expect(out).toContain(t);
+    }
   });
   it("tells the agent to recapture an initiative when the plan changes mid-work", () => {
     // Same contract as the MCP tool description (knowledge-tools.ts) — the two must not drift.
