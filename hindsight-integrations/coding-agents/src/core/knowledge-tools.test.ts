@@ -34,10 +34,23 @@ const EXPECTED_TOOLS = [
   "hindsight_reflect",
   "hindsight_capture_initiative",
   "hindsight_ingest_document",
+  // ★ FORK PATCH（lazy expansion）：三个「走链」工具 + 一个「读原文」工具。
+  //   用途：recall 只给排序最高的几行，而决定答案的那条可能因措辞不同被排在很后面
+  //   甚至被截掉；这些工具让 agent 自己沿 id/tag 走回去。
+  //   ⚠ 2026-10-07 补记：加这 4 个工具时【漏改了本列表】，导致该断言一直是红的。
+  //     教训：新增/删除工具必须同步更新此列表，否则这个测试永远失败。
+  "hindsight_read_memory",
+  "hindsight_read_chunk",
+  "hindsight_read_memory_chain",
+  "hindsight_read_source",
+  // ★ FORK PATCH（tag discovery，v447/v452）：「发现」工具。
+  //   上面那些工具都把 tag 当【输入】（read_memory_chain 明确要求 tag「取自被召回记忆的 tags」），
+  //   因此从未在召回里露面的族就够不着 —— story:<sessionId> 正是如此（名字是 uuid，猜不出）。
+  "hindsight_list_tags",
 ];
 
 describe("buildKnowledgeTools", () => {
-  it("returns exactly the eight expected tools (as a set)", () => {
+  it("returns exactly the thirteen expected tools (as a set)", () => {
     const client = stubClient();
     const tools = buildKnowledgeTools(client, "repo-a");
     expect(tools.map((t) => t.name).sort()).toEqual([...EXPECTED_TOOLS].sort());
@@ -282,6 +295,99 @@ describe("buildKnowledgeTools", () => {
       relatesToPageId: "initiative-uploader",
     });
     expect(JSON.parse(result.content[0].text)).toEqual({ page_id: "initiative-retry-backoff" });
+  });
+
+  // ★ FORK PATCH（tag discovery，v447/v452）：list_tags 的价值在【发现】，所以测三件事：
+  //   ① 它确实调用 client.listTags（而不是别的读法）
+  //   ② prefix 在客户端过滤（服务端忽略 prefix/tag 参数 —— 契约实测于 2026-10-08）
+  //   ③ limit/offset 以数字传给 client（参数进来是 string，见 dsh 投影层限制）
+  it("hindsight_list_tags lists tags and forwards numeric paging", async () => {
+    const client = stubClient({
+      listTags: vi.fn(async () => [
+        { tag: "env:local", count: 12 },
+        { tag: "story:s00", count: 4 },
+        { tag: "story:s01", count: 3 },
+      ]),
+    });
+    const tools = buildKnowledgeTools(client, "repo-a");
+    const tool = findTool(tools, "hindsight_list_tags");
+    const result = await tool.handler({ limit: "50", offset: "5" });
+    expect(client.listTags).toHaveBeenCalledWith({ limit: 50, offset: 5, prefix: undefined });
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      prefix: null,
+      count: 3,
+      tags: [
+        { tag: "env:local", count: 12 },
+        { tag: "story:s00", count: 4 },
+        { tag: "story:s01", count: 3 },
+      ],
+    });
+  });
+
+  it("hindsight_list_tags passes prefix through to the client (server ignores it)", async () => {
+    const client = stubClient({ listTags: vi.fn(async () => []) });
+    const tools = buildKnowledgeTools(client, "repo-a");
+    const tool = findTool(tools, "hindsight_list_tags");
+    await tool.handler({ prefix: "story:" });
+    expect(client.listTags).toHaveBeenCalledWith({ limit: 200, offset: 0, prefix: "story:" });
+  });
+
+  it("hindsight_list_tags clamps paging to safe bounds and tolerates garbage", async () => {
+    const client = stubClient({ listTags: vi.fn(async () => []) });
+    const tools = buildKnowledgeTools(client, "repo-a");
+    const tool = findTool(tools, "hindsight_list_tags");
+    await tool.handler({ limit: "99999", offset: "-3" });
+    expect(client.listTags).toHaveBeenCalledWith({ limit: 1000, offset: 0, prefix: undefined });
+    await tool.handler({ limit: "abc", offset: "xyz" });
+    expect(client.listTags).toHaveBeenLastCalledWith({ limit: 200, offset: 0, prefix: undefined });
+  });
+
+  it("hindsight_list_tags' description points at the chain tool and the uuid problem", () => {
+    const tools = buildKnowledgeTools(stubClient(), "repo-a");
+    const desc = findTool(tools, "hindsight_list_tags").description ?? "";
+    expect(desc).toContain("hindsight_read_memory_chain");
+    expect(desc).toContain("story:");
+  });
+
+  // ★ FORK PATCH（v485）：链工具的 tags_match 参数
+  //   缺口：listByTag 原本只发 ?tags=X（不带 tags_match）⇒ 服务端按 `all` 处理
+  //        ⇒ 把 tags 完全为空的记忆一并返回。实测（隔离库 2 带标签 + 2 真无标签）：
+  //          不传 ⇒ 4 条（含 2 条无标签）；all_strict ⇒ 2 条。
+  //        真实 archive 有 84.9% 无标签 ⇒ 按 story 取回会被淹没。
+  it("hindsight_read_memory_chain defaults to all_strict and forwards the mode", async () => {
+    const client = stubClient({ listByTag: vi.fn(async () => []) });
+    const tools = buildKnowledgeTools(client, "repo-a");
+    const tool = findTool(tools, "hindsight_read_memory_chain");
+
+    // 省略 tags_match ⇒ 默认 all_strict（不是服务端的 all）
+    await tool.handler({ tag: "story:s1" });
+    expect(client.listByTag).toHaveBeenCalledWith("story:s1", 50, "all_strict");
+
+    // 显式传合法值 ⇒ 透传
+    await tool.handler({ tag: "story:s1", tags_match: "all" });
+    expect(client.listByTag).toHaveBeenLastCalledWith("story:s1", 50, "all");
+
+    await tool.handler({ tag: "story:s1", limit: "200", tags_match: "any_strict" });
+    expect(client.listByTag).toHaveBeenLastCalledWith("story:s1", 200, "any_strict");
+  });
+
+  it("hindsight_read_memory_chain falls back to all_strict on an unknown tags_match", async () => {
+    const client = stubClient({ listByTag: vi.fn(async () => []) });
+    const tools = buildKnowledgeTools(client, "repo-a");
+    const tool = findTool(tools, "hindsight_read_memory_chain");
+    // 写错一个值（大小写/拼写）不应变成服务端的 all，而应回落到工具的正确默认
+    await tool.handler({ tag: "t", tags_match: "ALL" });
+    expect(client.listByTag).toHaveBeenLastCalledWith("t", 50, "all_strict");
+    await tool.handler({ tag: "t", tags_match: "strict" });
+    expect(client.listByTag).toHaveBeenLastCalledWith("t", 50, "all_strict");
+  });
+
+  it("hindsight_read_memory_chain reports the mode it actually used", async () => {
+    const client = stubClient({ listByTag: vi.fn(async () => []) });
+    const tools = buildKnowledgeTools(client, "repo-a");
+    const tool = findTool(tools, "hindsight_read_memory_chain");
+    const out = JSON.parse((await tool.handler({ tag: "t" })).content[0].text);
+    expect(out.tags_match).toBe("all_strict");
   });
 
   // Regression guard for the "ONCE, EARLY" contract that told agents to capture the opening plan
