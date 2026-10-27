@@ -99,15 +99,40 @@ interface HookClient {
   readonly bank?: string;
 }
 
+/** Read a positive integer from the environment, falling back to `fallback`.
+ *  `0` is meaningful (it disables the retry entirely), so it is accepted. */
+function envTurns(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = Number.parseInt(raw.trim(), 10);
+  return Number.isFinite(v) && v >= 0 ? v : fallback;
+}
+
 /** How many turns auto-inject may FAIL on before a session gives up on memory. The budget is
  *  turns, not time: each retry costs another full attempt (up to `reflectTimeoutMs` on the
- *  reflect path), so a dead server spends this many turns before every later turn is free. */
-const HOOK_INJECT_ATTEMPTS = 2;
+ *  reflect path), so a dead server spends this many turns before every later turn is free.
+ *
+ *  ★ FORK DEFAULT (hz): 8, not upstream's 2, and overridable.
+ *
+ *  Why the fork carries a different default: upstream sizes this budget for a HOSTED API, which
+ *  is either up or down — two turns of a 4xx/5xx says "the key is wrong" and there is no point
+ *  retrying. This fork exists to point the same integration at a SELF-HOSTED server on a LAN
+ *  (`apiUrl: http://<lan-ip>:8888`), where a timeout is routine weather rather than a verdict:
+ *  a restart, a Wi-Fi roam, a consolidation spike, or a laptop waking up all look identical to a
+ *  dead host from here. At 2 turns one such blip spends the whole session's memory — the exact
+ *  failure this fork was started to fix. Set `HINDSIGHT_INJECT_FAIL_ATTEMPTS` to override
+ *  (0 disables retrying; upstream behaviour is 2). */
+const HOOK_INJECT_ATTEMPTS = envTurns("HINDSIGHT_INJECT_FAIL_ATTEMPTS", 8);
 
 /** How many turns a pages/recall source may come back EMPTY on before the session stops asking.
  *  Larger than the failure budget: an empty retrieval is cheap (no LLM), and its query is the
- *  current prompt, so an opener like "hi" matching nothing says nothing about the real question. */
-const HOOK_INJECT_EMPTY_ATTEMPTS = 5;
+ *  current prompt, so an opener like "hi" matching nothing says nothing about the real question.
+ *
+ *  ★ FORK DEFAULT (hz): 8, not upstream's 5, and overridable. Same reason as above — a self-hosted
+ *  LAN server answers an unrelated prompt with an empty set more often than a hosted one, and the
+ *  cost of one more cheap retry is far below the cost of a session that stops asking.
+ *  Override with `HINDSIGHT_INJECT_EMPTY_ATTEMPTS`. */
+const HOOK_INJECT_EMPTY_ATTEMPTS = envTurns("HINDSIGHT_INJECT_EMPTY_ATTEMPTS", 8);
 
 /**
  * What to cache for a once-per-session auto-injection, given what the source returned.

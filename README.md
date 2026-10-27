@@ -1,3 +1,23 @@
+> ## ★ 这是 `hz` fork —— 为「本地自建服务端」而 fork
+>
+> 上游 [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) 是按**托管 API** 设计的：
+> 服务端要么在线要么挂掉，两轮失败就足够判定，不需要给网络抖动留余地。
+>
+> 这个 fork 服务的是另一种场景：**服务端是局域网里另一台机器上自建的 Hindsight**
+> （主力部署 `http://192.168.1.6:8888`，客户端在另一台 Windows 机器上）。
+> 在这个场景里，超时是日常天气而不是判决 —— 服务重启、Wi-Fi 漫游、归并高峰、机器休眠唤醒，
+> 从客户端看长得一模一样。上游的 2 轮预算会让一次抖动吃掉整场会话的记忆，这正是 fork 的起点。
+>
+> | 差异 | 上游默认 | 本 fork 默认 | 可覆盖 |
+> |---|---|---|---|
+> | 注入失败预算（轮） | 2 | **8** | `HINDSIGHT_INJECT_FAIL_ATTEMPTS` |
+> | 空召回预算（轮） | 5 | **8** | `HINDSIGHT_INJECT_EMPTY_ATTEMPTS` |
+> | memory-chain 5 个只读工具 | 无（上游 #5429 未合） | 有 | — |
+>
+> 版本号规则、分支职责、升级流程、部署侧现状见 **[FORK.md](FORK.md)**；
+> 每个 hz 版本改了什么见 **[CHANGELOG-hz.md](CHANGELOG-hz.md)**；
+> 维护这个仓库的 agent 请先读 **[AGENTS.md](AGENTS.md)**。
+
 <div align="center">
 
 ![Hindsight Banner](./hindsight-docs/static/img/hindsight-github-banner.png)
