@@ -871,3 +871,103 @@ describe("HindsightClient rate-limit patience", () => {
     expect(fetchMock.mock.calls.length).toBeLessThan(6);
   });
 });
+
+// The five chain-reading methods. What is pinned here is the HTTP SHAPE — the paths, the query
+// parameter names, and the caps — because each of those has a failure mode that looks like
+// success: `?tag=` instead of `?tags=` returns an unfiltered page, an over-broad tag returns 25k
+// tokens, and the chunk route under /banks/ 404s.
+describe("HindsightClient chain-reading methods", () => {
+  const mk = () => new HindsightClient({ apiUrl: "http://x/", bank: "b" });
+
+  it("getMemory reads one memory under the bank", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request) => jsonResponse(200, { id: "m1", text: "row", tags: ["t:a"] }));
+    vi.stubGlobal("fetch", fetchMock);
+    const m = await mk().getMemory("m1");
+    expect(String(fetchMock.mock.calls[0][0])).toBe("http://x/v1/default/banks/b/memories/m1");
+    expect(m).toEqual({ id: "m1", text: "row", tags: ["t:a"] });
+  });
+
+  it("getMemory turns a 404 into a named error, not an empty row", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string | URL | Request) => jsonResponse(404, { detail: "no such memory" })));
+    await expect(mk().getMemory("gone")).rejects.toThrow(/memory not found: gone/);
+  });
+
+  // REGRESSION GUARD: the chunk endpoint is deliberately bank-less. A caller that routes it
+  // through bankUrl() builds /banks/<bank>/chunks/<id>, which the server 404s — and because
+  // getSource calls this method, one wrong prefix breaks two tools at once.
+  it("getChunk uses the bank-less chunk route", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request) => jsonResponse(200, { chunk_id: "c1", text: "verbatim" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const c = await mk().getChunk("c1");
+    expect(String(fetchMock.mock.calls[0][0])).toBe("http://x/v1/default/chunks/c1");
+    expect(c).toEqual({ chunk_id: "c1", text: "verbatim" });
+  });
+
+  it("listByTag sends tags (plural) with the mode, and caps the page at 200 rows", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request) => jsonResponse(200, { items: [{ id: "m1" }] }));
+    vi.stubGlobal("fetch", fetchMock);
+    const rows = await mk().listByTag("story:s1", 50, "all_strict");
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      "http://x/v1/default/banks/b/memories/list?limit=50&tags=story%3As1&tags_match=all_strict"
+    );
+    expect(rows).toEqual([{ id: "m1" }]);
+    // An over-broad tag measured 200 rows / ~25.5k tokens on a real archive: more than a local
+    // server's whole per-slot window, so the cap is what keeps a chain lookup from blowing context.
+    await mk().listByTag("project:x", 9999);
+    expect(String(fetchMock.mock.calls[1][0])).toContain("limit=200");
+  });
+
+  it("listByTag returns [] for a 404 instead of throwing (bank not created yet)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string | URL | Request) => jsonResponse(404, {})));
+    await expect(mk().listByTag("t:a")).resolves.toEqual([]);
+  });
+
+  it("listTags pages /tags and filters the prefix client-side", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request) =>
+      jsonResponse(200, {
+        items: [
+          { tag: "env:local", count: 12 },
+          { tag: "story:s1", count: 4 },
+        ],
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const all = await mk().listTags({ limit: 5, offset: 10 });
+    expect(String(fetchMock.mock.calls[0][0])).toBe(
+      "http://x/v1/default/banks/b/tags?limit=5&offset=10"
+    );
+    expect(all).toHaveLength(2);
+    // The server ignores its own prefix/tag params, so filtering has to happen here.
+    const story = await mk().listTags({ prefix: "story:" });
+    expect(story).toEqual([{ tag: "story:s1", count: 4 }]);
+  });
+
+  it("getSource reads the row's own chunk when it has one", async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request) =>
+      String(url).includes("/chunks/")
+        ? jsonResponse(200, { text: "verbatim" })
+        : jsonResponse(200, { id: "o1", chunk_id: "c1", text: "fact" })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const out = await mk().getSource("o1");
+    expect(out.hops).toBe(1);
+    expect(out.chunk).toEqual({ text: "verbatim" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("getSource follows the source-fact hop for a merged observation with no chunk_id", async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("/chunks/")) return jsonResponse(200, { text: "verbatim" });
+      if (u.endsWith("/memories/f1")) return jsonResponse(200, { id: "f1", chunk_id: "c9" });
+      return jsonResponse(200, { id: "o1", text: "merged", source_memory_ids: ["f1"] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const out = await mk().getSource("o1");
+    // Consolidated observations carry NO chunk_id of their own — exactly the rows most worth
+    // checking, so the hop is the whole point of this method.
+    expect(out.hops).toBe(2);
+    expect(out.source_facts).toEqual([{ id: "f1", chunk_id: "c9" }]);
+    expect(out.chunk).toEqual({ text: "verbatim" });
+  });
+});

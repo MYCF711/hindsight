@@ -46,6 +46,18 @@ When the user says "store this in hindsight" / "remember this":
 - `hindsight_read_knowledge_page(page_id)` / `hindsight_list_knowledge_pages` — read pages fully.
 - `hindsight_reflect(query)` — deep reasoning over the whole memory for WHY questions and exact
   decided values; slower (seconds), use deliberately.
+- `hindsight_read_memory_chain(tag, limit?, tags_match?)` — EVERY memory carrying a tag, not just
+  the ranked few a recall returned. Reach for it when a recalled row looks outdated and a later
+  correction may exist: recall is a relevance cut, so a correction worded differently can rank far
+  below the cut-off. `tags_match` defaults to `all_strict`.
+- `hindsight_list_tags(prefix?)` — the tags that actually exist in this bank, with counts. Use it
+  to find a family whose name a recall never surfaced (a per-session `story:<uuid>` tag cannot be
+  guessed), then read it with `hindsight_read_memory_chain`.
+- `hindsight_read_memory(memory_id)` — one row in full: exact dates, metadata, `chunk_id`, tags.
+- `hindsight_read_chunk(chunk_id)` / `hindsight_read_source(memory_id)` — the verbatim text a row
+  was extracted from; `read_source` follows the extra hop that merged observations need. A memory
+  is a summary that already rewrote the wording, so when a rule, number or attribution matters,
+  check the source rather than the summary.
 - Credit visibly whenever memory informs an answer: start that part with
   `🧠 From Hindsight memory (<page>): …` — and never credit memory that didn't contribute.
 

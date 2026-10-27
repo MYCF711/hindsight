@@ -100,6 +100,41 @@ export function resolveRetainScopes(
  */
 export const DEFAULT_OBSERVATION_SCOPES: ObservationScopes = "shared";
 
+/**
+ * One row of a recall/list response, structurally typed.
+ *
+ * The recall path used to narrow the payload to `{ text?: string }` at the call site, so every
+ * field the ingest layer writes (`tags`, `chunk_id`, `occurred_start`, `metadata`) and every
+ * addressing field the server returns (`id`, `source_memory_ids`) was invisible — to the type
+ * system and therefore to the agent. All fields are optional: an older server simply omits them.
+ */
+export interface RecallResultRow {
+  text?: string;
+  id?: string;
+  /** The server names the record date `date` on some rows and `mentioned_at` on others. */
+  date?: string;
+  mentioned_at?: string;
+  occurred_start?: string;
+  metadata?: Record<string, unknown>;
+  tags?: string[];
+  chunk_id?: string;
+  /** Provenance of a consolidated observation: the facts it was merged from. Only those carry a
+   *  `chunk_id`, so following this hop is the only way to reach the verbatim text of a merged row. */
+  source_memory_ids?: string[];
+  source_fact_ids?: string[];
+}
+
+/**
+ * The server's five tag-matching modes, in the order it lists them.
+ *
+ * The distinction that matters: `all` / `any` include rows carrying NO tags at all, while
+ * `all_strict` / `any_strict` exclude them. Measured on an isolated bank holding 2 tagged and 2
+ * truly tag-less rows, identical on `/memories/recall` and `/memories/list`: `all` ⇒ 4 rows,
+ * `all_strict` ⇒ 2. On a real archive 84.9% of rows are untagged, so a story lookup that cannot
+ * say "strict" is swamped by rows that merely never got a tag.
+ */
+export type TagsMatchMode = "any" | "all" | "any_strict" | "all_strict" | "exact";
+
 export interface ClientOpts {
   apiUrl: string;
   apiToken?: string;
@@ -858,8 +893,142 @@ export class HindsightClient {
       opts.timeoutMs
     );
     if (r.status === 404) return [];
-    const j = (await r.json()) as { results?: { text?: string }[] };
+    const j = (await r.json()) as { results?: RecallResultRow[] };
     return (j.results ?? []).map((x) => (x.text ?? "").trim()).filter(Boolean);
+  }
+
+  // ── Chain-reading tools ────────────────────────────────────────────────────────────────────
+  // recall returns at most `rerank_max_candidates` rows, chosen by a ranker that scores topical
+  // similarity. A memory that is far from the query's topic but decisive for the answer — a later
+  // correction, a "this was a test" note, a qualifier recorded in a different session — cannot
+  // survive that cut. Measured on a trap corpus: the terminal row of a chain ranked 70th of 106
+  // candidates, so no rewording of the query reaches it. The fix cannot be a better ranker; it is
+  // to give the caller the means to walk the chain itself. Every row already carries an `id`, so
+  // the caller can ask for one specific neighbour once it suspects the recall set is partial.
+  // Four of the five tools below need nothing but an id or a tag, which is why they are cheap.
+
+  /** Read one memory in full by id, including the fields recall's text-only projection dropped. */
+  async getMemory(memoryId: string): Promise<RecallResultRow> {
+    const r = await this.req("GET", this.bankUrl(`/memories/${encodeURIComponent(memoryId)}`));
+    if (r.status === 404) throw new Error(`memory not found: ${memoryId}`);
+    return (await r.json()) as RecallResultRow;
+  }
+
+  /** The original text a memory was extracted from, by chunk id (recall returns `chunk_id`).
+   *  This is the verbatim layer — the only one that can settle whether a summary distorted its
+   *  source, since the summary has already rewritten the wording.
+   *
+   *  The chunk endpoint is deliberately bank-less (`{apiUrl}/v1/default/chunks/<id>`); there is no
+   *  `/banks/<bank>/chunks/` route, so `bankUrl()` must NOT be used here. */
+  async getChunk(chunkId: string): Promise<unknown> {
+    const r = await this.req(
+      "GET",
+      `${this.apiUrl}/v1/default/chunks/${encodeURIComponent(chunkId)}`
+    );
+    if (r.status === 404) throw new Error(`chunk not found: ${chunkId}`);
+    return await r.json();
+  }
+
+  /** Every memory carrying a tag — the family behind a row, not just the ranked few.
+   *
+   *  Measured: a tag lookup returns 24 rows where interactive recall returned 5, and it is the
+   *  only path to a terminal layer ranked 70th of 106 candidates.
+   *
+   *  The query parameter is `tags`, not `tag`: `?tag=` is silently IGNORED by the server, which
+   *  answers with an unfiltered page that looks like success. `tags_match` defaults to `all` — the
+   *  historical behaviour — so this stays purely additive for existing callers; a caller that
+   *  wants only rows really carrying the tag asks for `all_strict`. */
+  async listByTag(
+    tag: string,
+    limit = 50,
+    tagsMatch: TagsMatchMode = "all"
+  ): Promise<RecallResultRow[]> {
+    // Cap the page size. Measured on a real archive: one over-broad tag (`project:<workspace>`)
+    // matches 200 rows / ~25.5k tokens — more than a local server's whole per-slot window. A chain
+    // lookup wants a SMALL family, so an over-broad tag must degrade to a truncated answer rather
+    // than blow the caller's context. 200 is the server's own page ceiling.
+    limit = Math.min(Number(limit) || 50, 200);
+    const q =
+      `?limit=${limit}&tags=${encodeURIComponent(tag)}` +
+      `&tags_match=${encodeURIComponent(tagsMatch)}`;
+    const r = await this.req("GET", this.bankUrl(`/memories/list${q}`), null, [404], 2e4);
+    if (r.status === 404) return [];
+    const j = (await r.json()) as { items?: RecallResultRow[]; memories?: RecallResultRow[] };
+    return j.items ?? j.memories ?? [];
+  }
+
+  /** The tags that actually exist in this bank, with how many memories carry each.
+   *
+   *  Every other tag-aware tool takes a tag as INPUT, so a family whose name never surfaced in a
+   *  recall is otherwise unreachable — most visibly per-session `story:<sessionId>` tags, where the
+   *  name is a uuid nobody can guess. Measured: 21 distinct tags on a 61k-memory bank, so listing
+   *  the whole set is cheap.
+   *
+   *  Endpoint contract, probed on a 25-story isolated bank:
+   *    GET /tags ⇒ 200 {"items":[{"tag":"env:local","count":4282},…],"total":N,"limit":L,"offset":O}
+   *    Server-side paging works: `?limit=5` ⇒ 5 items; `?offset=5` ⇒ 23 of 28.
+   *    `?prefix=` and `?tag=` are IGNORED by the server; `?q=` exists but is not a prefix filter
+   *    (returned 0 for the string "story"). So `prefix` is applied here, not on the server. */
+  async listTags(opts: { limit?: number; offset?: number; prefix?: string } = {}): Promise<
+    Array<{ tag: string; count: number }>
+  > {
+    const limit = Math.min(Math.max(Number(opts.limit) || 200, 1), 1000);
+    const offset = Math.max(Number(opts.offset) || 0, 0);
+    const q = `?limit=${limit}&offset=${offset}`;
+    const r = await this.req("GET", this.bankUrl(`/tags${q}`), null, [404], 2e4);
+    if (r.status === 404) return [];
+    const j = (await r.json()) as { items?: Array<{ tag?: unknown; count?: unknown }> };
+    let rows = (j.items ?? [])
+      .map((x) => ({ tag: String(x.tag ?? ""), count: Number(x.count) || 0 }))
+      .filter((x) => x.tag !== "");
+    if (opts.prefix) rows = rows.filter((x) => x.tag.startsWith(opts.prefix as string));
+    return rows;
+  }
+
+  /** Reach the verbatim source of ANY memory, following the fact layer when needed.
+   *
+   *  Consolidated observations — the layer carrying a project's settled conclusions, and on a trap
+   *  corpus every decisive terminal row — have NO `chunk_id`. They record provenance in
+   *  `source_memory_ids` instead, pointing at the facts they were merged from, and only those facts
+   *  carry a `chunk_id`. So a plain "read the chunk" step dead-ends on exactly the rows most worth
+   *  checking; this method walks that hop so the caller does not have to know the schema.
+   *
+   *  Returns `{ memory, source_facts, chunk, hops }`; `hops` is 1 when the row had its own chunk,
+   *  2 when one of its source facts supplied it. */
+  async getSource(memoryId: string): Promise<{
+    memory: RecallResultRow;
+    source_facts: unknown[];
+    chunk: unknown;
+    hops: number;
+  }> {
+    const m = await this.getMemory(memoryId);
+    const out: {
+      memory: RecallResultRow;
+      source_facts: unknown[];
+      chunk: unknown;
+      hops: number;
+    } = { memory: m, source_facts: [], chunk: null, hops: 0 };
+    if (m.chunk_id) {
+      out.chunk = await this.getChunk(m.chunk_id);
+      out.hops = 1;
+      return out;
+    }
+    const ids = m.source_memory_ids ?? m.source_fact_ids ?? [];
+    for (const sid of ids.slice(0, 5)) {
+      try {
+        const sf = await this.getMemory(sid);
+        out.source_facts.push(sf);
+        if (sf.chunk_id && !out.chunk) {
+          out.chunk = await this.getChunk(sf.chunk_id);
+          out.hops = 2;
+        }
+      } catch (e) {
+        // A source fact may have been superseded or deleted; keep walking rather than fail the
+        // whole lookup over one missing hop.
+        out.source_facts.push({ id: sid, error: String(e).slice(0, 200) });
+      }
+    }
+    return out;
   }
 
   /**
