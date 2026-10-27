@@ -18,7 +18,7 @@ describe("selectTools", () => {
     expect(selectTools(cfg, stubClient, "b")).toEqual([]);
   });
 
-  it("returns the eight hindsight_* tool specs when enabled", () => {
+  it("returns the thirteen hindsight_* tool specs when enabled", () => {
     const cfg = resolveConfig({});
     const tools = selectTools(cfg, stubClient, "b");
     expect(tools.map((t) => t.name).sort()).toEqual(
@@ -31,6 +31,12 @@ describe("selectTools", () => {
         "hindsight_reflect",
         "hindsight_capture_initiative",
         "hindsight_ingest_document",
+        // Chain-reading tools, all read-only.
+        "hindsight_read_memory",
+        "hindsight_read_chunk",
+        "hindsight_read_memory_chain",
+        "hindsight_read_source",
+        "hindsight_list_tags",
       ].sort()
     );
   });
@@ -226,6 +232,12 @@ describe("buildMcpServer", () => {
       hindsight_reflect: readOnly,
       hindsight_capture_initiative: nonDestructiveWrite,
       hindsight_ingest_document: nonDestructiveWrite,
+      // Every chain-reading tool is read-only, same annotations as the page readers above.
+      hindsight_read_memory: readOnly,
+      hindsight_read_chunk: readOnly,
+      hindsight_read_memory_chain: readOnly,
+      hindsight_read_source: readOnly,
+      hindsight_list_tags: readOnly,
     };
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const server = buildMcpServer(selectTools(resolveConfig({}), stubClient, "b"));

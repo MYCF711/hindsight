@@ -87,7 +87,25 @@ const TOOL_GUIDE =
   "scope, or rationale materially changes mid-work, so the page tracks the current plan and not the opening one. " +
   "Skip bug fixes, small tweaks, chores, and trivial course-corrections.\n" +
   "- hindsight_ingest_document(title, content) — save an external document or durable notes/findings you want " +
-  "remembered (not the current conversation — that is captured automatically at session end).";
+  "remembered (not the current conversation — that is captured automatically at session end).\n" +
+  // Chain-reading tools. Naming them here is not decoration: a tool whose guidance is missing from
+  // the injected block is effectively absent — the agent has no reason to reach for it. Recall is a
+  // ranked EXCERPT, and the row that decides an answer can be irrelevant to the question yet part
+  // of the same story, so these are the tools for the moments recall looks wrong.
+  "- hindsight_list_tags(prefix?) — the tags that actually EXIST in this bank, with counts. Every " +
+  "other tag tool takes a tag as INPUT, so a family that never surfaced in a recall is unreachable " +
+  "by name (a per-session `story:<uuid>` tag cannot be guessed). Use it to find a family.\n" +
+  "- hindsight_read_memory_chain(tag, limit?, tags_match?) — every memory carrying a tag, not just " +
+  "the ranked few recall returned (measured: 24 rows where recall returned 5, and the decisive row " +
+  "sat at rank 70 of 106). Reach for it when a recalled row looks outdated and a later correction " +
+  "may exist. `tags_match` defaults to `all_strict`: only rows that really carry the tag.\n" +
+  "- hindsight_read_memory(memory_id) — one memory in full, including fields recall's text-only " +
+  "projection drops (exact dates, metadata, chunk_id, tags).\n" +
+  "- hindsight_read_chunk(chunk_id) / hindsight_read_source(memory_id) — the VERBATIM text a row was " +
+  "extracted from; `read_source` follows the extra hop that merged observations need. The row you " +
+  "were shown is a summary that has already rewritten the wording, so when a rule, number or " +
+  "attribution is load-bearing, check the source rather than the summary — and if the source shows " +
+  "the memory is wrong, correct the record with hindsight_ingest_document.";
 
 /**
  * Any autoInject other than "reflect" means no first-prompt synthesis. Keep the pull trigger explicit,

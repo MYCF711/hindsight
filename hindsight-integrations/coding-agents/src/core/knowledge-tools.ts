@@ -271,6 +271,172 @@ export function buildKnowledgeTools(
       annotations: READ_ONLY_ANNOTATIONS,
       handler: guarded(async ({ page_id }) => client.getPage(page_id)),
     },
+    // ── Chain-reading tools ──────────────────────────────────────────────────────────────────
+    // Five read-only tools that let the agent walk a memory chain instead of trusting the ranked
+    // excerpt it was handed. Recall's 5-row cut is a RELEVANCE cut, and the row that decides an
+    // answer can be irrelevant to the question yet part of the same story — a later correction, a
+    // "this was a test" note, a qualifier recorded in another session. Measured on a trap corpus:
+    // the decisive row ranked 70th of 106 candidates, so no rewording reaches it. Every row already
+    // carries an `id` and `tags`, so these tools are what those two fields are for.
+    //
+    // They do not duplicate recall or hindsight_search_knowledge_pages: pages are curated
+    // summaries, recall is a ranked excerpt, and these reach the raw rows and the text they came
+    // from. Start with `list_tags` when the family name is unknown, `read_memory_chain` when it is.
+    {
+      name: "hindsight_read_memory",
+      description:
+        "Read one memory in full by its id, including fields recall does not show (entities, " +
+        "occurred_start/end, document_id, chunk_id, and the raw metadata written at ingest). Use " +
+        "this when the injected memories look incomplete or mutually inconsistent — e.g. two rows " +
+        "describe the same decision with different conclusions, or a row's date is much later than " +
+        "the events it describes. Typically the first step of tracing a chain: read the row you " +
+        "doubt, then follow its chunk_id (hindsight_read_chunk) or its tags " +
+        "(hindsight_read_memory_chain).",
+      inputSchema: {
+        memory_id: z
+          .string()
+          .describe("the `id` of a memory, as returned by recall or by this tool's siblings"),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      handler: guarded(async ({ memory_id }) => client.getMemory(memory_id)),
+    },
+    {
+      name: "hindsight_read_chunk",
+      description:
+        "Read the ORIGINAL text a memory was extracted from, by its chunk_id (recall returns one " +
+        "per row). This is the verbatim layer: the memory you were shown is a summary that has " +
+        "already rewritten the wording, so it cannot settle whether it distorted its source — only " +
+        "the chunk can. Reach for this when a memory states a rule, decision, number, or " +
+        "attribution that you are about to rely on, or when two memories conflict and you need to " +
+        "know which one the source actually supports. Note the chunk may contain several messages, " +
+        "including ones the summary dropped entirely.",
+      inputSchema: {
+        chunk_id: z.string().describe("the `chunk_id` of a memory, as returned by recall"),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      handler: guarded(async ({ chunk_id }) => client.getChunk(chunk_id)),
+    },
+    {
+      name: "hindsight_read_memory_chain",
+      description:
+        "Read every memory sharing a tag, instead of only the handful recall ranked highest. " +
+        "Recall returns at most `rerank_max_candidates` rows (5 by default), chosen by topical " +
+        'similarity — so a row that is part of the same story but worded differently (a later ' +
+        'correction, a "this was a test" note, a qualifier recorded in another session) can be ' +
+        "excluded no matter how the query is phrased. When a recalled memory carries a tag that " +
+        "looks like a family (`trap:...`, `project:...`, `bank:...`, or any `key:value`), call " +
+        "this with that tag to see the whole family. Measured: 24 rows retrieved where recall " +
+        "returned 5, reaching a decisive row ranked 70th of 106. If you do not know the family's " +
+        "name, hindsight_list_tags lists what exists.",
+      inputSchema: {
+        tag: z
+          .string()
+          .describe("a single tag, e.g. 'trap:TRAP-A' — taken from a recalled memory's `tags`"),
+        // `limit` is a STRING, not a number: a host that projects these schemas through a
+        // string-only parameter layer fails the WHOLE registration batch when one field is a
+        // number, and the symptom is "unknown tool" for every sibling rather than an error about
+        // this field. Such hosts exist, so the schema stays all-string and the handler parses and
+        // clamps. Same reason for the string-typed fields in hindsight_list_tags below.
+        limit: z
+          .string()
+          .optional()
+          .describe("max rows, as a decimal string (default 50; capped at 200)"),
+        // Which of the server's five tag-matching modes to use. Without the choice this tool can
+        // only express `all`, which also returns rows carrying NO tags — measured on an isolated
+        // bank: 2 tagged + 2 tag-less ⇒ `all` returns 4, `all_strict` returns 2. On a real archive
+        // 84.9% of rows are untagged, so a story lookup would be swamped. The default here is the
+        // strict mode: only rows that really carry the tag.
+        tags_match: z
+          .string()
+          .optional()
+          .describe(
+            "'all_strict' (default — only rows that really carry the tag) | 'all' (also return " +
+              "rows with no tags at all) | 'any_strict' | 'any' | 'exact'"
+          ),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      handler: guarded(async ({ tag, limit, tags_match }) => {
+        const parsed = limit === undefined ? 50 : Number.parseInt(String(limit), 10);
+        const safe = Number.isFinite(parsed) ? Math.max(1, Math.min(200, parsed)) : 50;
+        // Only the values the server recognises; anything else falls back to this tool's correct
+        // default rather than being forwarded as-is and quietly matching `all`.
+        const MODES = ["any", "all", "any_strict", "all_strict", "exact"] as const;
+        const mode =
+          typeof tags_match === "string" && (MODES as readonly string[]).includes(tags_match)
+            ? (tags_match as (typeof MODES)[number])
+            : "all_strict";
+        return {
+          tag,
+          tags_match: mode,
+          memories: (await client.listByTag(tag, safe, mode)).map((m) => ({
+            id: m.id,
+            date: m.date ?? m.mentioned_at ?? null,
+            text: m.text,
+          })),
+        };
+      }),
+    },
+    {
+      name: "hindsight_list_tags",
+      description:
+        "List the tags that actually exist in this bank, with how many memories carry each. " +
+        "Use this to DISCOVER families instead of guessing their names: every sibling tool " +
+        "takes a tag as input (hindsight_read_memory_chain expects one 'taken from a recalled " +
+        "memory`s tags'), so a family that never surfaced in a recall is otherwise unreachable. " +
+        "This matters most for per-session story tags (`story:<sessionId>`), whose names are " +
+        "uuids no agent can guess. Measured on a real archive: 21 distinct tags, so the whole " +
+        "list is cheap; pass `prefix` (e.g. 'story:') to narrow it. Combine with " +
+        "hindsight_read_memory_chain to then read a whole family.",
+      inputSchema: {
+        prefix: z
+          .string()
+          .optional()
+          .describe(
+            "only return tags starting with this prefix, e.g. 'story:' (applied client-side; " +
+              "the server ignores its own prefix/ tag/ query params)"
+          ),
+        limit: z
+          .string()
+          .optional()
+          .describe("max rows, as a decimal string (default 200; capped at 1000)"),
+        offset: z
+          .string()
+          .optional()
+          .describe("rows to skip, as a decimal string (default 0) — the server pages natively"),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      handler: guarded(async ({ prefix, limit, offset }) => {
+        const p = limit === undefined ? 200 : Number.parseInt(String(limit), 10);
+        const safeLimit = Number.isFinite(p) ? Math.max(1, Math.min(1000, p)) : 200;
+        const o = offset === undefined ? 0 : Number.parseInt(String(offset), 10);
+        const safeOffset = Number.isFinite(o) && o > 0 ? o : 0;
+        const tags = await client.listTags({ limit: safeLimit, offset: safeOffset, prefix });
+        return {
+          prefix: prefix ?? null,
+          count: tags.length,
+          tags: tags.map((t) => ({ tag: t.tag, count: t.count })),
+        };
+      }),
+    },
+    {
+      name: "hindsight_read_source",
+      description:
+        "Get the ORIGINAL text behind any memory, automatically following the extra hop that " +
+        "consolidated observations require. Use this instead of hindsight_read_chunk when you do " +
+        "not know whether a row is a raw fact or a merged observation: observations — the layer " +
+        "that carries a project's settled conclusions, and the layer most worth checking — have " +
+        "no chunk_id of their own and point at their source facts instead. This tool walks that " +
+        "hop for you and returns the memory, its source facts, and the first chunk text found. " +
+        "Prefer it when you are checking whether a conclusion is faithful to what was actually " +
+        "recorded.",
+      inputSchema: {
+        memory_id: z
+          .string()
+          .describe("the `id` of a memory, as returned by recall or by hindsight_read_memory_chain"),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      handler: guarded(async ({ memory_id }) => client.getSource(memory_id)),
+    },
     {
       name: "hindsight_reflect",
       description:
