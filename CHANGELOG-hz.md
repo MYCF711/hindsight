@@ -7,6 +7,32 @@
 
 ---
 
+## v1.1.0-hz.3 — 2026-10-28
+
+**基点**：同 hz.2（上游 `main@1e3a4841`）。
+
+**新增**
+
+- **DSH 记忆纪律段**（`hindsight-integrations/coding-agents/src/dsh-discipline.ts` + `src/dsh.ts` 接线）：
+  - 注册 `hindsight:discipline` system prompt section，`order = Number.MAX_SAFE_INTEGER - 1`
+    （system 段末尾，recency 最高；与 `sovereign:clause` 同权重、按名字排序）
+  - 内容约 1,200 字符：三条反模式（不手动解析 asar / 状态与写入一律走工具 / 一次取不到 ≠ 坏了）
+    + 13 工具全表（含原始层 `read_memory` / `read_chunk` / `read_source`）
+    + 「知识页是摘要，核对原文用 read_chunk」+「写记忆之前先判落点」
+  - 与 `LocalMemory/plugin/hindsight-client/hindsight-discipline.js`（本机补丁层）同源；
+    本 fork 构建产物生效后，该本地补丁层应删除，避免两份同名 section
+
+**验证**
+
+- TypeScript 类型改动：`DshContext.inject` 改为泛型 `inject<T = DshToolContext>`，调用处显式传 `DshSystemPromptContext`
+- 未构建/未替换 `vendor/hindsight`（当前 vendor 仍是旧线 + 手补丁；见 FORK.md「部署侧现状」）
+
+**部署状态**
+
+- 仅源码提交；构建与 vendor 替换留待下一次升级（按 FORK.md 流程）
+
+---
+
 ## v1.1.0-hz.2 — 2026-10-28
 
 **基点**：同 hz.1（上游 `main@1e3a4841`）。

@@ -29,6 +29,7 @@ import type { ToolSpec } from "./core/knowledge-tools";
 import { log } from "./core/log";
 import { RuntimeCore } from "./core/runtime";
 import { HINDSIGHT_PLUGIN, readDshEvents, type DshSessionEvent } from "./core/transcript-dsh";
+import { registerDisciplineSection, type DshSystemPromptContext } from "./dsh-discipline";
 
 const HARNESS = "dsh";
 
@@ -36,7 +37,7 @@ const HARNESS = "dsh";
 export const name = HINDSIGHT_PLUGIN;
 
 /** The agent registry owns the lifecycle events below; without it there is nothing to bind. */
-export const inject = ["agents"];
+export const inject = ["agents", "systemPrompt"];
 
 // ── host shapes (structural: this package must not depend on dsh's packages) ─────
 
@@ -97,7 +98,7 @@ interface DshContext {
     event: "agent/disposed",
     listener: (payload: { agent: DshAgent }) => void
   ): (() => void) | void;
-  inject(names: string[], callback: (ctx: DshToolContext) => void): void;
+  inject<T = DshToolContext>(names: string[], callback: (ctx: T) => void): void;
 }
 
 interface DshToolContext {
@@ -452,6 +453,10 @@ export function apply(ctx: DshContext): void {
   // recall, injection and write-back.
   ctx.inject(["tools"], (toolCtx) => {
     registerTools(toolCtx, process.cwd());
+  });
+  // 记忆使用纪律：system 段末尾（recency 最高）。
+  ctx.inject<DshSystemPromptContext>(["systemPrompt"], (promptCtx) => {
+    registerDisciplineSection(promptCtx);
   });
 }
 
