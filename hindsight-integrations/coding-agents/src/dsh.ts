@@ -7,7 +7,7 @@
  * install (neither bridge ships in a default profile) while losing the transcript, the session id
  * and the awaited stop boundary.
  *
- *   agent/session-start  -> RuntimeCore.seedIfCold      (cold-check + background git/codebase seed)
+ *   agent/created        -> RuntimeCore.seedIfCold      (cold-check + background git/codebase seed)
  *   agent/pre-step       -> RuntimeCore.onPrompt        (recall) + the injection as a sourced message
  *   agent/turn-stopping  -> RuntimeCore.onSessionIdle   (write-back of the completed exchange)
  *   ctx.tools            -> the hindsight_* knowledge suite, registered natively
@@ -77,9 +77,16 @@ interface PreStepPayload {
 
 /** The Cordis context surface this plugin uses. */
 interface DshContext {
+  /**
+   * The creation announcement. `agent/session-start` — what this integration used to bind — is not
+   * an event this dsh ever emits: a session edge is announced as `agent/created` (serial, with the
+   * creation `source`: fresh / resume / clear / compaction), and a listener bound to the old name is
+   * simply never called. Binding the real announcement keeps the cold-check on the session edge
+   * instead of waiting for the first prompt's pre-step to notice it.
+   */
   on(
-    event: "agent/session-start",
-    listener: (payload: { agent: DshAgent }) => void
+    event: "agent/created",
+    listener: (payload: { agent: DshAgent; source?: string; signal?: AbortSignal }) => void
   ): (() => void) | void;
   on(
     event: "agent/pre-step",
@@ -199,9 +206,10 @@ function workspaceFor(root: string): Workspace | undefined {
 /**
  * Start this repo's cold-check + background seed once.
  *
- * Fire-and-forget by design: `agent/session-start` is an emit that no extension point awaits, and
- * the Web UI must not wait on a network round-trip to open a session. Nothing the first prompt
- * needs comes from here — it builds its own knowledge preamble from that session's page list.
+ * Fire-and-forget by design: `agent/created` is a serial creation announcement, but the Web UI must
+ * not wait on a network round-trip to open a session, so the returned promise is deliberately not
+ * awaited. Nothing the first prompt needs comes from here — it builds its own knowledge preamble
+ * from that session's page list.
  */
 function ensureSeeded(workspace: Workspace): void {
   workspace.seeded ??= workspace.core.seedIfCold(workspace.root);
@@ -280,7 +288,7 @@ export function lastInjectedText(events: readonly DshSessionEvent[]): string | u
  */
 export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefined) {
   return {
-    sessionStart({ agent }: { agent: DshAgent }): void {
+    agentCreated({ agent }: { agent: DshAgent }): void {
       const workspace = resolve(agent);
       if (!workspace) return;
       liveAgents.set(agent.session.header.id, agent);
@@ -297,8 +305,9 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
       if (!workspace) return decision;
       const sessionId = agent.session.header.id;
       liveAgents.set(sessionId, agent);
-      // A resumed session gets no `agent/session-start` in some compositions; seeding here too
-      // keeps the cold-check exactly-once without depending on which events a host fired.
+      // A resumed session re-announces as `agent/created` (source: resume) on hosts that keep the
+      // announcement on resume; seeding here too keeps the cold-check exactly-once without
+      // depending on which lifecycle edge a given host fires.
       ensureSeeded(workspace);
       // No new human input means a tool continuation: recall already ran for this turn, and its
       // block is already in the history the model is about to be sent.
@@ -442,7 +451,7 @@ function specsOf(workspace: Workspace): ToolSpec[] {
  */
 export function apply(ctx: DshContext): void {
   const hooks = createDshHooks(workspaceForAgent);
-  ctx.on("agent/session-start", hooks.sessionStart);
+  ctx.on("agent/created", hooks.agentCreated);
   // `prepend: true` puts this listener outermost, so the injection is appended AFTER every other
   // contributor's messages — the memory block reads last, closest to the model's turn.
   ctx.on("agent/pre-step", hooks.preStep, { prepend: true });

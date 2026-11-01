@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  apply,
   createDshHooks,
   dshSessionEvents,
   ownEvents,
@@ -182,17 +183,42 @@ describe("dsh write-back", () => {
   });
 });
 
-describe("dsh session start", () => {
+describe("dsh agent creation", () => {
   it("starts the repo seed exactly once, however many sessions open", () => {
     const core = { seedIfCold: vi.fn(async () => {}) };
     const workspace = { core: core as never, root: "/repo" } as Workspace;
     const hooks = createDshHooks(() => workspace);
 
-    hooks.sessionStart({ agent: agentWith("s-1") });
-    hooks.sessionStart({ agent: agentWith("s-2") });
+    hooks.agentCreated({ agent: agentWith("s-1") });
+    hooks.agentCreated({ agent: agentWith("s-2") });
 
     expect(core.seedIfCold).toHaveBeenCalledOnce();
     expect(core.seedIfCold).toHaveBeenCalledWith("/repo");
+  });
+});
+
+describe("dsh plugin wiring", () => {
+  it("binds the lifecycle events dsh actually emits", () => {
+    const bound: string[] = [];
+    const ctx = {
+      on: (event: string) => {
+        bound.push(event);
+      },
+      inject: () => {},
+    };
+
+    apply(ctx as never);
+
+    // `agent/session-start` was the old first entry and is a name no dsh release emits: the
+    // listener registered cleanly and was simply never called, so the seed silently fell back to
+    // the first pre-step. Asserting the exact list keeps that regression visible in the diff.
+    expect(bound).toEqual([
+      "agent/created",
+      "agent/pre-step",
+      "agent/turn-stopping",
+      "agent/disposed",
+    ]);
+    expect(bound).not.toContain("agent/session-start");
   });
 });
 
