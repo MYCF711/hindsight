@@ -3,6 +3,10 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: {
     index: "src/index.ts",
+    // The programmatic SDK, published as the `./sdk` subpath (see src/sdk/index.ts). The key is a
+    // path because package.json `exports["./sdk"]` names `dist/sdk/index.js` — the output has to
+    // land exactly there or the subpath resolves to nothing.
+    "sdk/index": "src/sdk/index.ts",
     // opencode v2 (`opencode2`) loads this via the package's root index.js, which re-exports it.
     // Its plugin contract shares nothing with v1's, so it is a separate entry — see src/opencode2.ts.
     opencode2: "src/opencode2.ts",
@@ -77,7 +81,10 @@ export default defineConfig({
   format: ["esm"],
   target: "node18",
   clean: true,
-  dts: { entry: "src/index.ts" },
+  // `dts` is a SEPARATE entry list in tsup, not a flag on the JS build: a declaration file is only
+  // emitted for an entry named here. Omitting the SDK leaves `exports["./sdk"].types` pointing at
+  // `dist/sdk/index.d.ts`, which would then never exist.
+  dts: { entry: ["src/index.ts", "src/sdk/index.ts"] },
   shims: false,
   // Each bin entry (claude-hook.js, cursor-hook.js, codex-hook.js, deepen.js, status.js, mcp-server.js,
   // hindsight-seed.js) must be a single self-contained file: hosts wire a hook by absolute path to

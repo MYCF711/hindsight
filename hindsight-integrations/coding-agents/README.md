@@ -1146,6 +1146,46 @@ the skill and the README each documented a different subset of the same settings
 is generated from this file too (`node hindsight-docs/scripts/sync-coding-agents-doc.mjs`), which
 drops the markers along with the contributor-only sections.
 
+## SDK
+
+`@vectorize-io/hindsight-coding-agents/sdk` is the programmatic face of this package: one factory,
+one error type, and a JSON-serializable tool list, for code that wants the same memory the agent's
+hooks use. Everything else under `dist/` is internal to a host integration — this subpath is the
+part that is meant to be imported.
+
+```ts
+import { createHindsight, HindsightSdkError } from "@vectorize-io/hindsight-coding-agents/sdk";
+
+// Bank and credential resolved exactly as every hook/plugin entry resolves them for this repo.
+const memory = createHindsight({ directory: process.cwd() });
+
+const hits = await memory.searchPages("how are errors surfaced?");
+const why = await memory.reflect("why did we drop the retry allowlist?");
+const { ok, data, error } = await memory.callTool("hindsight_list_knowledge_pages", {});
+```
+
+The surface is `health()`, `recall()`, `searchPages()`, `readPage()`, `listPages()`, `reflect()`,
+`ingestDocument()`, `memory()`, `tags()`, `status()`, `tools()` and `callTool()`. Each delegates to
+the same client the hooks use, so a bank read through the SDK is the bank the agent writes: the
+`directory` is resolved by the same `bankId` / `bankIdTemplate` / `mapPathToBank` / `optInOnly`
+rules, and `createHindsight({ config })` takes an already-resolved config when the caller owns it.
+
+Failures are a single type, `HindsightSdkError`, with a closed `kind` (`config`, `auth`, `network`,
+`timeout`, `rate_limit`, `server`, `unsupported`, `unknown`), the HTTP `status` when there was one,
+and the original error as `cause`. `callTool()` is the exception: it never throws, it returns
+`{ ok: false, error: { kind, message } }`.
+
+`tools()` returns plain JSON — JSON Schema, no zod objects and no handler functions — so a host can
+project it into its own tool format; `callTool()` dispatches to the same registry the MCP server
+registers, so an ingest through the SDK produces the same document id as one through MCP. A
+disabled integration (config `disabled`, a repo `optInOnly` has not approved, an unidentifiable
+repository) yields `tools() === []`, `status().disabled === true` and `config`-kind errors from
+calls — the same inert behavior a host gets, rather than an exception at construction.
+
+**Token safety.** The credential signs requests and never leaves the object: `hasToken` is a
+boolean, `status()` reports booleans only, and no method, error message or serialization returns the
+token value. There is deliberately no client accessor to reach one through.
+
 <!-- skill:begin -->
 
 ## Diagnostics & logging

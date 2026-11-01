@@ -164,6 +164,10 @@ describe("long-lived hosts build their client through the shared factory", () =>
     "core/session-start.ts": "one-shot hook process, same",
     "status.ts": "one-shot CLI resolving config from --config/--harness, not from a workspace",
     "deepen.ts": "one-shot CLI, same",
+    "sdk/index.ts":
+      "the public SDK can be handed an ALREADY-RESOLVED config (its `config` option), which the " +
+      "shared factory cannot express — it always re-reads the config file; the config-less path " +
+      "resolves through the same core/config.ts + core/bank.ts steps this factory runs",
   };
 
   function sourceFiles(dir: string, prefix = ""): string[] {
