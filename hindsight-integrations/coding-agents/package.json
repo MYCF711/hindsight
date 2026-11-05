@@ -8,6 +8,9 @@
   },
   "description": "Reflect-only Hindsight long-term memory for coding agents (harness-pluggable: opencode, …), with automatic background ingestion (no setup CLI).",
   "type": "module",
+  "engines": {
+    "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
