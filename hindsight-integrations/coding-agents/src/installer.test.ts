@@ -1967,6 +1967,16 @@ describe("the published manifest", () => {
     expect(manifest.dsh).toBeDefined();
     expect(manifest.cline).toBeDefined();
   });
+
+  it("declares a DSH engine range that really includes 0.2.2-rc.1", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8")
+    ) as Record<string, unknown>;
+    // node-semver excludes later prerelease lines from a bare >=0.2.1-rc.x range: spell out the
+    // first compatible 0.2.2 prerelease. DSH evaluates with includePrerelease:true, so the -0
+    // upper bound is what keeps 0.3.0 prereleases out too.
+    expect(manifest.engines).toMatchObject({ dsh: ">=0.2.2-rc.1 <0.3.0-0" });
+  });
 });
 
 describe("pi and prime-agent do not disturb each other", () => {
