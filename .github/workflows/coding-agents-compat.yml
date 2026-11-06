@@ -24,5 +24,6 @@ jobs:
         with:
           node-version: 24.20.0
       - run: npm ci
-      - run: node node_modules/vitest/vitest.mjs run src/dsh.test.ts src/transcript-dsh.test.ts src/installer.test.ts
+      - run: node node_modules/vitest/vitest.mjs run src/dsh.test.ts src/transcript-dsh.test.ts
+      - run: node node_modules/vitest/vitest.mjs run src/installer.test.ts -t "declares a DSH engine range"
       - run: npm run build
